@@ -3,3 +3,4 @@ managed_components/
 sdkconfig
 dependencies.lock
 sdkconfig.old
+components/mt_proto/test/build/

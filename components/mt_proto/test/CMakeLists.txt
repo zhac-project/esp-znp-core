@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(mt_proto_tests CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(test_mt_proto test_mt_proto.cpp ../mt_proto.cpp)
+target_include_directories(test_mt_proto PRIVATE ../include)
+enable_testing()
+add_test(NAME mt_proto COMMAND test_mt_proto)
