@@ -1,22 +1,26 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "esp_zigbee.h"   // v2.x all-in-one header (was esp_zigbee_core.h in v1.x)
 #include "znp_uart.h"
+#include "znp_dispatch.h"
+#include "znp_ezb.h"
 
 static const char *TAG = "znp_core";
 
-void app_main(void)
-{
-    // Default NVS partition — erase + retry if unformatted / version-bumped
-    // (otherwise ESP_ERROR_CHECK panics on a fresh/erased device).
+/* RX task hands each received frame here; dispatch builds an encoded response
+ * (or 0) and we write it straight back. Runs in the UART RX task context. */
+static void on_frame(const mt_frame_t *f) {
+    uint8_t buf[260];
+    size_t n = znp_dispatch(f, znp_ezb_backend(), buf, sizeof(buf));
+    if (n > 0) znp_uart_send_raw(buf, n);
+}
+
+void app_main(void) {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-
-    // v2.x: zb_storage is an NVS partition the Zigbee stack will use later.
     ret = nvs_flash_init_partition("zb_storage");
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase_partition("zb_storage"));
@@ -24,9 +28,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    znp_uart_init(NULL);
+    znp_uart_init(on_frame);
 
-    ESP_LOGI(TAG, "esp-znp-core boot");
-    ESP_LOGI(TAG, "esp-zigbee-lib version: %s", esp_zigbee_get_version_string());
-    ESP_LOGI(TAG, "MT-NCP foundation ready (stack not started)");
+    /* Announce we just booted — the host toggles NRESET and waits for this. */
+    uint8_t buf[16];
+    size_t n = znp_build_reset_ind(0x00, buf, sizeof(buf));
+    znp_uart_send_raw(buf, n);
+
+    ESP_LOGI(TAG, "esp-znp-core MT-NCP up: SYS link ready, RESET_IND sent");
 }
