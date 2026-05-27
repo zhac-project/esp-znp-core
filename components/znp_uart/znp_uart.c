@@ -38,8 +38,18 @@ bool znp_uart_send_raw(const uint8_t *buf, size_t len) {
     return w == (int)len;
 }
 
-/* Placeholder so the component links in Task 2.1; replaced in Task 2.2. */
 static void rx_task(void *arg) {
     (void)arg;
-    for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    static mt_parser_t parser;
+    mt_parser_reset(&parser);
+    uint8_t chunk[64];
+    mt_frame_t frame;
+    for (;;) {
+        int n = uart_read_bytes(PORT, chunk, sizeof(chunk), pdMS_TO_TICKS(100));
+        for (int i = 0; i < n; i++) {
+            if (mt_parser_feed(&parser, chunk[i], &frame) == 1 && s_cb) {
+                s_cb(&frame);   /* payload valid only during this call */
+            }
+        }
+    }
 }
