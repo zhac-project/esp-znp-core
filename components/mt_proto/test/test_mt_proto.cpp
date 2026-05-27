@@ -46,9 +46,42 @@ static void test_encode() {
     CHECK(mt_encode(&toobig, b3, sizeof(b3)) == 0);
 }
 
+static void test_decode() {
+    mt_frame_t out;
+    /* valid SYS_PING SREQ */
+    const uint8_t ping[5] = {0xFE, 0x00, 0x21, 0x01, 0x20};
+    CHECK(mt_decode(ping, 5, &out) == MT_DECODE_OK);
+    CHECK(out.cmd0 == 0x21 && out.cmd1 == 0x01 && out.payload_len == 0);
+
+    /* valid SYS_PING SRSP with 2-byte payload */
+    const uint8_t srsp[7] = {0xFE, 0x02, 0x61, 0x01, 0x79, 0x00, 0x1B};
+    CHECK(mt_decode(srsp, 7, &out) == MT_DECODE_OK);
+    CHECK(out.payload_len == 2 && out.payload[0] == 0x79 && out.payload[1] == 0x00);
+
+    /* bad SOF */
+    const uint8_t bad_sof[5] = {0x00, 0x00, 0x21, 0x01, 0x20};
+    CHECK(mt_decode(bad_sof, 5, &out) == MT_DECODE_BAD_SOF);
+
+    /* corrupted FCS */
+    const uint8_t bad_fcs[5] = {0xFE, 0x00, 0x21, 0x01, 0xFF};
+    CHECK(mt_decode(bad_fcs, 5, &out) == MT_DECODE_FCS_ERROR);
+
+    /* truncated */
+    CHECK(mt_decode(ping, 3, &out) == MT_DECODE_TRUNCATED);
+
+    /* payload length exceeds MT_MAX_PAYLOAD -> overflow */
+    const uint8_t overflow[5] = {0xFE, 0xFF, 0x21, 0x01, 0x00};
+    CHECK(mt_decode(overflow, 5, &out) == MT_DECODE_OVERFLOW);
+
+    /* header present but buffer short of declared payload -> truncated (second guard) */
+    const uint8_t shortpl[6] = {0xFE, 0x02, 0x61, 0x01, 0x79, 0x00};  /* len=6, needs 7 */
+    CHECK(mt_decode(shortpl, 6, &out) == MT_DECODE_TRUNCATED);
+}
+
 int main() {
     test_fcs();
     test_encode();
+    test_decode();
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all mt_proto tests passed\n");
     return 0;
