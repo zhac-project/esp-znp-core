@@ -1,0 +1,7 @@
+# Name,       Type, SubType, Offset,  Size,    Flags
+nvs,          data, nvs,     ,        0x6000,
+phy_init,     data, phy,     ,        0x1000,
+factory,      app,  factory, ,        0x140000,
+zb_storage,   data, nvs,     ,        0x4000,
+# zb_fct: factory blob, read-only at runtime (read via esp_partition_read, not nvs_flash_init). 'readonly' satisfies IDF v6.0 min-0x3000 RW-NVS rule.
+zb_fct,       data, nvs,     ,        0x1000,   readonly

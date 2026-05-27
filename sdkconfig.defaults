@@ -1,0 +1,7 @@
+CONFIG_IDF_TARGET="esp32c6"
+# esp-zigbee-lib (v2.x) — native 802.15.4 radio on C6/H2
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_RADIO_NATIVE=y
+# custom partition table (zb_storage must be NVS in v2.x)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
