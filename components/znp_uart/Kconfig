@@ -1,0 +1,23 @@
+menu "ZNP UART (MT NCP link)"
+
+    config ZNP_UART_PORT
+        int "UART port number"
+        default 1
+        help
+            UART peripheral used for the MT link to the host (P4).
+
+    config ZNP_UART_TX_GPIO
+        int "TX GPIO"
+        default 5
+
+    config ZNP_UART_RX_GPIO
+        int "RX GPIO"
+        default 4
+
+    config ZNP_UART_BAUD
+        int "Baud rate"
+        default 115200
+        help
+            Must match the host. P4 znp_driver uses 115200 8N1, no flow control.
+
+endmenu

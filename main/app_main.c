@@ -1,6 +1,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_zigbee.h"   // v2.x all-in-one header (was esp_zigbee_core.h in v1.x)
+#include "znp_uart.h"
 
 static const char *TAG = "znp_core";
 
@@ -22,6 +23,8 @@ void app_main(void)
         ret = nvs_flash_init_partition("zb_storage");
     }
     ESP_ERROR_CHECK(ret);
+
+    znp_uart_init(NULL);
 
     ESP_LOGI(TAG, "esp-znp-core boot");
     ESP_LOGI(TAG, "esp-zigbee-lib version: %s", esp_zigbee_get_version_string());

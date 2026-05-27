@@ -1,0 +1,45 @@
+#include "znp_uart.h"
+#include "driver/uart.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include <string.h>
+
+static const char *TAG = "znp_uart";
+static const uart_port_t PORT = CONFIG_ZNP_UART_PORT;
+static znp_frame_cb_t s_cb = NULL;
+
+#define ZNP_UART_RX_BUF 512
+
+static void rx_task(void *arg);   /* implemented in Task 2.2 */
+
+void znp_uart_init(znp_frame_cb_t cb) {
+    s_cb = cb;
+    const uart_config_t cfg = {
+        .baud_rate = CONFIG_ZNP_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(PORT, ZNP_UART_RX_BUF, ZNP_UART_RX_BUF, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(PORT, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(PORT, CONFIG_ZNP_UART_TX_GPIO, CONFIG_ZNP_UART_RX_GPIO,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    xTaskCreate(rx_task, "znp_uart_rx", 4096, NULL, 10, NULL);
+    ESP_LOGI(TAG, "UART%d up @ %d 8N1 (tx=%d rx=%d)", PORT, CONFIG_ZNP_UART_BAUD,
+             CONFIG_ZNP_UART_TX_GPIO, CONFIG_ZNP_UART_RX_GPIO);
+}
+
+bool znp_uart_send_raw(const uint8_t *buf, size_t len) {
+    if (!buf || len == 0) return false;
+    int w = uart_write_bytes(PORT, (const char *)buf, len);
+    return w == (int)len;
+}
+
+/* Placeholder so the component links in Task 2.1; replaced in Task 2.2. */
+static void rx_task(void *arg) {
+    (void)arg;
+    for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+}
