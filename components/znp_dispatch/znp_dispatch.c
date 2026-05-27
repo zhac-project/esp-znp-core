@@ -34,5 +34,8 @@ size_t znp_dispatch(const mt_frame_t *req, const znp_backend_t *be,
 }
 
 size_t znp_build_reset_ind(uint8_t reason, uint8_t *buf, size_t cap) {
-    (void)reason; (void)buf; (void)cap; return 0;   /* implemented in Task 3.2 */
+    const uint8_t pl[6] = { reason, ZNP_TRANSPORT_REV, ZNP_PRODUCT_ID,
+                            ZNP_VER_MAJOR, ZNP_VER_MINOR, ZNP_VER_MAINT };
+    mt_frame_t f = { MT_AREQ(ZNP_SYS), 0x80, 6, pl };
+    return mt_encode(&f, buf, cap);
 }

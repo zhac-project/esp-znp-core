@@ -46,11 +46,28 @@ static void test_unknown() {
     CHECK(znp_dispatch(&af, &FAKE, buf, sizeof(buf)) == 0);
 }
 
+static void test_reset_req() {
+    uint8_t buf[32]; mt_frame_t r = req(0x00);   /* SYS_RESET_REQ */
+    int before = s_reset_calls;
+    CHECK(znp_dispatch(&r, &FAKE, buf, sizeof(buf)) == 0);   /* no SRSP */
+    CHECK(s_reset_calls == before + 1);                      /* reset triggered */
+}
+
+static void test_reset_ind() {
+    uint8_t buf[32];
+    size_t n = znp_build_reset_ind(0x00, buf, sizeof(buf));
+    const uint8_t expect[11] = {0xFE,0x06,0x41,0x80,0x00,0x02,0x00,0x02,0x07,0x01,0xC1};
+    CHECK(n == 11);
+    CHECK(memcmp(buf, expect, 11) == 0);
+}
+
 int main() {
     test_ping();
     test_version();
     test_extaddr();
     test_unknown();
+    test_reset_req();
+    test_reset_ind();
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all znp_dispatch tests passed\n");
     return 0;
