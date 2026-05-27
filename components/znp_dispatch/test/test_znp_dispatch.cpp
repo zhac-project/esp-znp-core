@@ -7,10 +7,53 @@ static int g_fail = 0;
 
 /* ── fake backend ────────────────────────────────────────────────────────── */
 static uint8_t  s_ieee[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
-static int      s_reset_calls = 0;
+static int      s_reset_calls       = 0;
+static int      s_apply_cfg_calls   = 0;
+static int      s_start_calls       = 0;
+static int      s_bdb_commission_calls = 0;
+static uint8_t  s_last_bdb_mode     = 0xFF;
+/* call-order log: 0=apply_config, 1=start_stack (max 2 entries per test) */
+static int      s_call_log[2];
+static int      s_call_log_idx      = 0;
+
 static void fake_get_ieee(uint8_t out[8]) { memcpy(out, s_ieee, 8); }
 static void fake_reset(void)              { s_reset_calls++; }
-static const znp_backend_t FAKE = { fake_get_ieee, fake_reset };
+static void fake_apply_config(const znp_netcfg_t *cfg) {
+    (void)cfg;
+    if (s_call_log_idx < 2) s_call_log[s_call_log_idx++] = 0;
+    s_apply_cfg_calls++;
+}
+static bool fake_start_stack(void) {
+    if (s_call_log_idx < 2) s_call_log[s_call_log_idx++] = 1;
+    s_start_calls++;
+    return true;
+}
+static bool fake_bdb_commission(uint8_t ezb_mode) {
+    s_last_bdb_mode = ezb_mode;
+    s_bdb_commission_calls++;
+    return true;
+}
+
+static const znp_backend_t FAKE = {
+    .get_ieee       = fake_get_ieee,
+    .request_reset  = fake_reset,
+    .apply_config   = fake_apply_config,
+    .start_stack    = fake_start_stack,
+    .bdb_commission = fake_bdb_commission,
+    .get_nwk_info   = NULL,
+    .permit_join    = NULL,
+};
+
+static void reset_fake_state(void) {
+    s_reset_calls        = 0;
+    s_apply_cfg_calls    = 0;
+    s_start_calls        = 0;
+    s_bdb_commission_calls = 0;
+    s_last_bdb_mode      = 0xFF;
+    s_call_log[0]        = -1;
+    s_call_log[1]        = -1;
+    s_call_log_idx       = 0;
+}
 
 /* Helper: fresh ctx wrapping FAKE each time */
 static znp_dispatch_ctx make_ctx(void) {
@@ -163,6 +206,159 @@ static void test_nv_write_dispatch(void) {
     CHECK(ctx.cfg.have_pan_id == true);
 }
 
+/* ── Task 4.2: ZDO_STARTUP_FROM_APP ──────────────────────────────────────── */
+
+static void test_startup_from_app(void) {
+    reset_fake_state();
+    /* Build ZDO_STARTUP_FROM_APP: MT_SREQ(ZNP_ZDO)/0x40, payload={0x00,0x00} */
+    const uint8_t payload[2] = {0x00, 0x00};
+    mt_frame_t r = { MT_SREQ(ZNP_ZDO), 0x40, sizeof(payload), payload };
+    uint8_t buf[32];
+    znp_dispatch_ctx ctx = make_ctx();
+
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    /* SRSP: FE + len(1) + MT_SRSP(ZNP_ZDO)(1) + 0x40(1) + status(1) + fcs(1) = 6 bytes */
+    CHECK(n == 6);
+    CHECK(buf[0] == 0xFE);
+    CHECK(buf[1] == 0x01);                 /* payload len = 1 (status byte) */
+    CHECK(buf[2] == MT_SRSP(ZNP_ZDO));     /* 0x65 */
+    CHECK(buf[3] == 0x40);
+    CHECK(buf[4] == 0x00);                 /* status = success */
+
+    /* apply_config called before start_stack */
+    CHECK(s_apply_cfg_calls == 1);
+    CHECK(s_start_calls == 1);
+    CHECK(s_call_log[0] == 0);   /* apply_config first */
+    CHECK(s_call_log[1] == 1);   /* start_stack second */
+}
+
+/* ── Task 4.2: APP_CNF BDB_START_COMMISSIONING ────────────────────────────── */
+
+static void test_bdb_start_formation(void) {
+    reset_fake_state();
+    /* TI mode 0x04 = FORMATION → EZB 0x08 */
+    const uint8_t payload[1] = {0x04};
+    mt_frame_t r = { MT_SREQ(ZNP_APP_CNF), 0x05, 1, payload };
+    uint8_t buf[32];
+    znp_dispatch_ctx ctx = make_ctx();
+
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    /* SRSP: MT_SRSP(ZNP_APP_CNF)/0x05, status 0x00 */
+    CHECK(n == 6);
+    CHECK(buf[2] == MT_SRSP(ZNP_APP_CNF));
+    CHECK(buf[3] == 0x05);
+    CHECK(buf[4] == 0x00);
+
+    CHECK(s_bdb_commission_calls == 1);
+    CHECK(s_last_bdb_mode == ZNP_EZB_BDB_FORMATION);   /* 0x08 */
+}
+
+static void test_bdb_start_steering(void) {
+    reset_fake_state();
+    /* TI mode 0x02 = STEERING → EZB 0x04 */
+    const uint8_t payload[1] = {0x02};
+    mt_frame_t r = { MT_SREQ(ZNP_APP_CNF), 0x05, 1, payload };
+    uint8_t buf[32];
+    znp_dispatch_ctx ctx = make_ctx();
+
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    CHECK(n == 6);
+    CHECK(buf[2] == MT_SRSP(ZNP_APP_CNF));
+    CHECK(buf[3] == 0x05);
+    CHECK(buf[4] == 0x00);
+
+    CHECK(s_bdb_commission_calls == 1);
+    CHECK(s_last_bdb_mode == ZNP_EZB_BDB_STEERING);    /* 0x04 */
+}
+
+/* ── Task 4.2: APP_CNF BDB_SET_CHANNEL ───────────────────────────────────── */
+
+static void test_bdb_set_channel(void) {
+    reset_fake_state();
+    /* isPrimary=1, chan_mask ch11=0x00000800 */
+    const uint8_t payload[5] = {0x01, 0x00, 0x08, 0x00, 0x00};
+    mt_frame_t r = { MT_SREQ(ZNP_APP_CNF), 0x08, 5, payload };
+    uint8_t buf[32];
+    znp_dispatch_ctx ctx = make_ctx();
+
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    /* SRSP: MT_SRSP(ZNP_APP_CNF)/0x08, status 0x00 */
+    CHECK(n == 6);
+    CHECK(buf[2] == MT_SRSP(ZNP_APP_CNF));
+    CHECK(buf[3] == 0x08);
+    CHECK(buf[4] == 0x00);
+}
+
+/* ── Task 4.2 (robustness): start_stack returns false → SRSP status 0x01 ─── */
+
+static bool fail_start_stack(void) { return false; }
+static bool fail_bdb_commission(uint8_t /*ezb_mode*/) { return false; }
+
+static const znp_backend_t FAIL_BE = {
+    .get_ieee       = nullptr,
+    .request_reset  = nullptr,
+    .apply_config   = nullptr,
+    .start_stack    = fail_start_stack,
+    .bdb_commission = fail_bdb_commission,
+    .get_nwk_info   = nullptr,
+    .permit_join    = nullptr,
+};
+
+static void test_startup_failure(void) {
+    /* start_stack returns false → STARTUP_FROM_APP SRSP status must be 0x01 */
+    znp_dispatch_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.be = &FAIL_BE;
+
+    const uint8_t payload[2] = {0x00, 0x00};
+    mt_frame_t r = { MT_SREQ(ZNP_ZDO), 0x40, sizeof(payload), payload };
+    uint8_t buf[32];
+
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[2] == MT_SRSP(ZNP_ZDO));
+    CHECK(buf[3] == 0x40);
+    CHECK(buf[4] == 0x01);   /* failure status */
+}
+
+/* ── Task 4.2: null-guard — NULL backend members don't crash ─────────────── */
+
+static void test_startup_null_backend(void) {
+    /* Backend with all new ops NULL — must not crash, must still SRSP */
+    static const znp_backend_t NULL_BE = {
+        .get_ieee       = nullptr,
+        .request_reset  = nullptr,
+        .apply_config   = nullptr,
+        .start_stack    = nullptr,
+        .bdb_commission = nullptr,
+        .get_nwk_info   = nullptr,
+        .permit_join    = nullptr,
+    };
+    znp_dispatch_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.be = &NULL_BE;
+
+    uint8_t buf[32];
+
+    /* ZDO_STARTUP_FROM_APP with NULL ops */
+    const uint8_t pl2[2] = {0x00, 0x00};
+    mt_frame_t r1 = { MT_SREQ(ZNP_ZDO), 0x40, 2, pl2 };
+    size_t n1 = znp_dispatch(&r1, &ctx, buf, sizeof(buf));
+    CHECK(n1 == 6);
+    CHECK(buf[4] == 0x00);
+
+    /* BDB_START_COMMISSIONING with NULL bdb_commission */
+    const uint8_t pl1[1] = {0x04};
+    mt_frame_t r2 = { MT_SREQ(ZNP_APP_CNF), 0x05, 1, pl1 };
+    size_t n2 = znp_dispatch(&r2, &ctx, buf, sizeof(buf));
+    CHECK(n2 == 6);
+    CHECK(buf[4] == 0x00);
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main() {
@@ -173,9 +369,16 @@ int main() {
     test_unknown();
     test_reset_req();
     test_reset_ind();
-    /* new */
+    /* new (task 4.1) */
     test_netcfg();
     test_nv_write_dispatch();
+    /* new (task 4.2) */
+    test_startup_from_app();
+    test_bdb_start_formation();
+    test_bdb_start_steering();
+    test_bdb_set_channel();
+    test_startup_null_backend();
+    test_startup_failure();
 
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all znp_dispatch tests passed\n");

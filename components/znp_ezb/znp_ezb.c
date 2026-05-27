@@ -20,6 +20,15 @@ static void ezb_request_reset(void) {
 }
 
 const znp_backend_t *znp_ezb_backend(void) {
-    static const znp_backend_t b = { ezb_get_ieee, ezb_request_reset };
+    static const znp_backend_t b = {
+        .get_ieee       = ezb_get_ieee,
+        .request_reset  = ezb_request_reset,
+        /* Task 4.5 will implement these: */
+        .apply_config   = NULL,
+        .start_stack    = NULL,
+        .bdb_commission = NULL,
+        .get_nwk_info   = NULL,
+        .permit_join    = NULL,
+    };
     return &b;
 }

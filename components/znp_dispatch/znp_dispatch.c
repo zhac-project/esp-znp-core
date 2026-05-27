@@ -8,6 +8,23 @@ static size_t encode_srsp(uint8_t cmd1, const uint8_t *pl, uint8_t pl_len,
     return mt_encode(&f, buf, cap);
 }
 
+static size_t encode_srsp_sub(uint8_t subsys, uint8_t cmd1,
+                               const uint8_t *pl, uint8_t pl_len,
+                               uint8_t *buf, size_t cap) {
+    mt_frame_t f = { MT_SRSP(subsys), cmd1, pl_len, pl };
+    return mt_encode(&f, buf, cap);
+}
+
+/* Map a TI Z-Stack BDB mode byte to the ESP-Zigbee (EZB) mode mask.
+ * TI FORMATION=0x04 → EZB 0x08, TI STEERING=0x02 → EZB 0x04.
+ * Unknown TI bits are silently dropped. */
+static uint8_t ti_bdb_to_ezb(uint8_t ti_mode) {
+    uint8_t ezb = 0;
+    if (ti_mode & ZNP_TI_BDB_FORMATION) ezb |= ZNP_EZB_BDB_FORMATION;
+    if (ti_mode & ZNP_TI_BDB_STEERING)  ezb |= ZNP_EZB_BDB_STEERING;
+    return ezb;
+}
+
 /* Decode a 2-byte little-endian uint16 */
 static uint16_t le16(const uint8_t *p) {
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
@@ -94,11 +111,70 @@ static size_t nv_read_srsp(uint8_t cmd1, const znp_netcfg_t *cfg,
 
 /* ── znp_dispatch ────────────────────────────────────────────────────────── */
 
+/* ── ZDO subsystem dispatcher ────────────────────────────────────────────── */
+
+static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
+                           uint8_t *buf, size_t cap) {
+    const znp_backend_t *be = ctx ? ctx->be : NULL;
+    const uint8_t status_ok[1] = { 0x00 };
+
+    switch (req->cmd1) {
+        /* ZDO_STARTUP_FROM_APP (0x40):
+         * P4 sends: MT_SREQ(ZNP_ZDO)/0x40, payload={0x00,0x00} (startup delay LE16)
+         * We: apply_config → start_stack, reply SRSP status 0x00 on success,
+         * 0x01 on failure. NULL backend op → treat as success. */
+        case 0x40: {
+            uint8_t status = 0x00;
+            if (be && be->apply_config) be->apply_config(ctx ? &ctx->cfg : NULL);
+            if (be && be->start_stack && !be->start_stack()) status = 0x01;
+            return encode_srsp_sub(ZNP_ZDO, 0x40, &status, 1, buf, cap);
+        }
+        default:
+            return 0;
+    }
+}
+
+/* ── APP_CNF subsystem dispatcher ────────────────────────────────────────── */
+
+static size_t dispatch_app_cnf(const mt_frame_t *req, znp_dispatch_ctx *ctx,
+                               uint8_t *buf, size_t cap) {
+    const znp_backend_t *be = ctx ? ctx->be : NULL;
+    const uint8_t status_ok[1] = { 0x00 };
+
+    switch (req->cmd1) {
+        /* BDB_SET_CHANNEL (0x08):
+         * payload: isPrimary(1) + chan_mask(4 LE).
+         * Channel was already captured via NV CHANLIST write; ack only. */
+        case 0x08:
+            return encode_srsp_sub(ZNP_APP_CNF, 0x08, status_ok, 1, buf, cap);
+
+        /* BDB_START_COMMISSIONING (0x05):
+         * payload: 1 byte TI BDB mode (0x04=FORMATION, 0x02=STEERING).
+         * Map TI→EZB and call bdb_commission. Status 0x01 on failure,
+         * 0x00 on success or NULL op. */
+        case 0x05: {
+            uint8_t ti_mode = (req->payload && req->payload_len >= 1)
+                              ? req->payload[0] : 0;
+            uint8_t ezb_mode = ti_bdb_to_ezb(ti_mode);
+            uint8_t status = 0x00;
+            if (be && be->bdb_commission && !be->bdb_commission(ezb_mode)) status = 0x01;
+            return encode_srsp_sub(ZNP_APP_CNF, 0x05, &status, 1, buf, cap);
+        }
+        default:
+            return 0;
+    }
+}
+
+/* ── znp_dispatch ────────────────────────────────────────────────────────── */
+
 size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
                     uint8_t *buf, size_t cap) {
-    if (req->cmd0 != MT_SREQ(ZNP_SYS)) return 0;   /* only SYS this phase */
-
     const znp_backend_t *be = ctx ? ctx->be : NULL;
+
+    /* Route by subsystem */
+    if (req->cmd0 == MT_SREQ(ZNP_ZDO))     return dispatch_zdo(req, ctx, buf, cap);
+    if (req->cmd0 == MT_SREQ(ZNP_APP_CNF)) return dispatch_app_cnf(req, ctx, buf, cap);
+    if (req->cmd0 != MT_SREQ(ZNP_SYS))     return 0;   /* unhandled subsystem */
 
     switch (req->cmd1) {
 

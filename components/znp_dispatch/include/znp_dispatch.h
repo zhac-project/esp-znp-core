@@ -39,11 +39,25 @@ typedef struct {
 bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,
                           const uint8_t *val, uint8_t len);
 
+/* ── EZB BDB mode constants (local defines — do NOT include esp-zigbee headers
+ * in the pure dispatcher; real calls happen in znp_ezb / Task 4.5). ─────── */
+#define ZNP_EZB_BDB_FORMATION 0x08   /* ESP-Zigbee ESP_ZB_BDB_MODE_NETWORK_FORMATION */
+#define ZNP_EZB_BDB_STEERING  0x04   /* ESP-Zigbee ESP_ZB_BDB_MODE_NETWORK_STEERING  */
+
+/* TI Z-Stack BDB mode byte values (from wire: zigbee_mgr.cpp do_commissioning) */
+#define ZNP_TI_BDB_FORMATION  0x04
+#define ZNP_TI_BDB_STEERING   0x02
+
 /* Thin seam between pure protocol logic and chip-specific actions, so the
  * dispatcher is host-testable with a fake backend. */
 typedef struct {
     void (*get_ieee)(uint8_t out[8]);   /* 802.15.4 EUI64, little-endian (wire order) */
     void (*request_reset)(void);        /* trigger a reset; RESET_IND follows on boot */
+    void (*apply_config)(const znp_netcfg_t *cfg);   /* push buffered cfg into the stack */
+    bool (*start_stack)(void);                        /* init coordinator + launch */
+    bool (*bdb_commission)(uint8_t ezb_mode_mask);   /* ezb_bdb_start_top_level_commissioning */
+    bool (*get_nwk_info)(uint16_t *panid, uint16_t *short_addr, uint8_t *dev_state); /* (4.3) */
+    bool (*permit_join)(uint8_t duration_s);
 } znp_backend_t;
 
 /* ── Dispatch context (carries config buffer + backend pointer) ──────────── */
