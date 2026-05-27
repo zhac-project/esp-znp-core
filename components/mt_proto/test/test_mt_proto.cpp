@@ -78,10 +78,58 @@ static void test_decode() {
     CHECK(mt_decode(shortpl, 6, &out) == MT_DECODE_TRUNCATED);
 }
 
+static void test_parser() {
+    mt_parser_t p; mt_parser_reset(&p);
+    mt_frame_t out;
+    const uint8_t ping[5] = {0xFE, 0x00, 0x21, 0x01, 0x20};
+
+    /* leading garbage (non-SOF) is ignored */
+    CHECK(mt_parser_feed(&p, 0x11, &out) == 0);
+    /* feed the 5 frame bytes; only the last (FCS) byte completes a frame */
+    CHECK(mt_parser_feed(&p, ping[0], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[1], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[2], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[3], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[4], &out) == 1);
+    CHECK(out.cmd0 == 0x21 && out.cmd1 == 0x01 && out.payload_len == 0);
+
+    /* a frame with payload: SYS_RESET_IND AREQ 0x41/0x80, 6-byte payload */
+    const uint8_t ind[11] = {0xFE,0x06,0x41,0x80,0x00,0x02,0x00,0x02,0x07,0x01,0xC1};
+    int done = 0;
+    for (int i = 0; i < 11; i++) done = mt_parser_feed(&p, ind[i], &out);
+    CHECK(done == 1);
+    CHECK(out.cmd0 == 0x41 && out.cmd1 == 0x80 && out.payload_len == 6);
+    CHECK(out.payload[1] == 0x02 && out.payload[4] == 0x07);
+
+    /* bad FCS resets without emitting */
+    mt_parser_reset(&p);
+    const uint8_t badf[5] = {0xFE,0x00,0x21,0x01,0xFF};
+    for (int i = 0; i < 4; i++) CHECK(mt_parser_feed(&p, badf[i], &out) == 0);
+    CHECK(mt_parser_feed(&p, badf[4], &out) == 0);   /* FCS mismatch -> 0 */
+
+    /* recovery: after the bad-FCS reset above, a subsequent valid frame still parses */
+    CHECK(mt_parser_feed(&p, ping[0], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[1], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[2], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[3], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[4], &out) == 1);
+    CHECK(out.cmd0 == 0x21 && out.cmd1 == 0x01);
+
+    /* two consecutive valid frames reusing the same parser instance */
+    const uint8_t srsp2[7] = {0xFE, 0x02, 0x61, 0x01, 0x79, 0x00, 0x1B};
+    int d2 = 0;
+    for (int i = 0; i < 7; i++) d2 = mt_parser_feed(&p, srsp2[i], &out);
+    CHECK(d2 == 1 && out.payload_len == 2 && out.payload[0] == 0x79);
+    int d3 = 0;
+    for (int i = 0; i < 7; i++) d3 = mt_parser_feed(&p, srsp2[i], &out);
+    CHECK(d3 == 1 && out.payload_len == 2 && out.payload[1] == 0x00);
+}
+
 int main() {
     test_fcs();
     test_encode();
     test_decode();
+    test_parser();
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all mt_proto tests passed\n");
     return 0;

@@ -35,3 +35,34 @@ mt_decode_result_t mt_decode(const uint8_t *buf, size_t len, mt_frame_t *out) {
     out->payload     = buf + 4;
     return MT_DECODE_OK;
 }
+
+void mt_parser_reset(mt_parser_t *p) {
+    p->state = 0; p->len = 0; p->idx = 0;
+}
+
+int mt_parser_feed(mt_parser_t *p, uint8_t b, mt_frame_t *out) {
+    switch (p->state) {
+        case 0: if (b == MT_SOF) p->state = 1; return 0;            /* SOF */
+        case 1:                                                     /* LEN */
+            p->len = b;
+            if (p->len > MT_MAX_PAYLOAD) { mt_parser_reset(p); return 0; }
+            p->state = 2; return 0;
+        case 2: p->cmd0 = b; p->state = 3; return 0;                /* CMD0 */
+        case 3: p->cmd1 = b; p->idx = 0; p->state = (p->len ? 4 : 5); return 0; /* CMD1 */
+        case 4:                                                     /* DATA */
+            p->data[p->idx++] = b;
+            if (p->idx >= p->len) p->state = 5;
+            return 0;
+        case 5: {                                                   /* FCS */
+            const uint8_t expect = mt_fcs(p->len, p->cmd0, p->cmd1, p->data, p->len);
+            const int ok = (expect == b);
+            if (ok && out) {
+                out->cmd0 = p->cmd0; out->cmd1 = p->cmd1;
+                out->payload_len = p->len; out->payload = p->data;
+            }
+            mt_parser_reset(p);
+            return ok ? 1 : 0;
+        }
+        default: mt_parser_reset(p); return 0;
+    }
+}

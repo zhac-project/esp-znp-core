@@ -46,6 +46,23 @@ size_t  mt_encode(const mt_frame_t *f, uint8_t *buf, size_t buf_size);
  * On OK, out->payload points into buf+4. */
 mt_decode_result_t mt_decode(const uint8_t *buf, size_t len, mt_frame_t *out);
 
+typedef struct {
+    uint8_t state;                  /* 0=SOF 1=LEN 2=CMD0 3=CMD1 4=DATA 5=FCS */
+    uint8_t len;
+    uint8_t cmd0;
+    uint8_t cmd1;
+    uint8_t idx;
+    uint8_t data[MT_MAX_PAYLOAD];
+} mt_parser_t;
+
+void mt_parser_reset(mt_parser_t *p);
+/* Feed one byte. Returns 1 and fills *out when a complete, FCS-valid frame is
+ * received; returns 0 otherwise (incl. FCS mismatch -> resets to SOF-hunt).
+ * LIFETIME: out->payload aliases p->data and is valid only until the next call
+ * to mt_parser_feed() or mt_parser_reset(). Copy the payload bytes before the
+ * next feed if you need them to outlive this call. */
+int  mt_parser_feed(mt_parser_t *p, uint8_t b, mt_frame_t *out);
+
 #ifdef __cplusplus
 }
 #endif
