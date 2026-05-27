@@ -488,6 +488,111 @@ static void test_startup_null_backend(void) {
     CHECK(buf[4] == 0x00);
 }
 
+/* ── Task 4.4: znp_build_state_change_ind ────────────────────────────────── */
+
+static void test_state_change_ind(void) {
+    uint8_t buf[32];
+    /* state=0x09 (DEV_ZB_COORD)
+     * AREQ 0x45/0xC0, payload=1 byte.
+     * FCS = 0x01 ^ 0x45 ^ 0xC0 ^ 0x09 = 0x8D
+     * Expected frame: FE 01 45 C0 09 8D  (6 bytes) */
+    size_t n = znp_build_state_change_ind(0x09, buf, sizeof(buf));
+    const uint8_t expect[6] = {0xFE, 0x01, 0x45, 0xC0, 0x09, 0x8D};
+    CHECK(n == 6);
+    CHECK(memcmp(buf, expect, 6) == 0);
+    /* Verify P4-read offset: buf[4] = state byte (zigbee_mgr.cpp:82) */
+    CHECK(buf[4] == 0x09);
+
+    /* Different state value — state=0x00 (DEV_HOLD) */
+    size_t n2 = znp_build_state_change_ind(0x00, buf, sizeof(buf));
+    CHECK(n2 == 6);
+    CHECK(buf[4] == 0x00);
+    /* FCS = 0x01^0x45^0xC0^0x00 = 0x84 */
+    CHECK(buf[5] == 0x84);
+}
+
+/* ── Task 4.4: znp_build_tc_dev_ind ─────────────────────────────────────── */
+
+static void test_tc_dev_ind(void) {
+    uint8_t buf[32];
+    /* nwk=0x1234, ieee=0x1122334455667788, capabilities=0x8E
+     * AREQ 0x45/0xCA, payload=11 bytes.
+     * Payload: 34 12 88 77 66 55 44 33 22 11 8E
+     * FCS = 0x0B^0x45^0xCA^0x34^0x12^0x88^0x77^0x66^0x55^0x44^0x33^0x22^0x11^0x8E
+     *     = 0xA4
+     * Expected frame (16 bytes):
+     *   FE 0B 45 CA 34 12 88 77 66 55 44 33 22 11 8E A4 */
+    size_t n = znp_build_tc_dev_ind(0x1234, 0x1122334455667788ULL, 0x8E,
+                                    buf, sizeof(buf));
+    const uint8_t expect[16] = {
+        0xFE, 0x0B, 0x45, 0xCA,
+        0x34, 0x12,              /* nwk LE = 0x1234 */
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  /* ieee LE */
+        0x8E,                    /* capabilities */
+        0xA4                     /* FCS */
+    };
+    CHECK(n == 16);
+    CHECK(memcmp(buf, expect, 16) == 0);
+    /* Verify P4-read offsets (zigbee_interview.cpp:590-592):
+     *   ev.nwk  = le16(payload[0..1])  → buf[4..5]
+     *   ev.ieee = le64(payload[2..9])  → buf[6..13] */
+    CHECK(buf[4] == 0x34 && buf[5] == 0x12);   /* nwk LE = 0x1234 */
+    CHECK(buf[6] == 0x88 && buf[13] == 0x11);  /* ieee[0] and ieee[7] */
+}
+
+static void test_tc_dev_ind_overflow(void) {
+    /* buf too small → must return 0 (mt_encode overflow guard) */
+    uint8_t small[4];
+    size_t n = znp_build_tc_dev_ind(0x0001, 0xAABBCCDDEEFF0011ULL, 0x00,
+                                    small, sizeof(small));
+    CHECK(n == 0);
+}
+
+/* ── Task 4.4: znp_build_leave_ind ──────────────────────────────────────── */
+
+static void test_leave_ind(void) {
+    uint8_t buf[32];
+    /* src=0xABCD, ieee=0x1122334455667788, remove=1, rejoin=0
+     * AREQ 0x45/0xC9, payload=12 bytes.
+     * Payload: CD AB 88 77 66 55 44 33 22 11 01 00
+     * FCS = 0x0C^0x45^0xC9^0xCD^0xAB^0x88^0x77^0x66^0x55^0x44^0x33^0x22^0x11^0x01^0x00
+     *     = 0x6F
+     * Expected frame (17 bytes):
+     *   FE 0C 45 C9 CD AB 88 77 66 55 44 33 22 11 01 00 6F */
+    size_t n = znp_build_leave_ind(0xABCD, 0x1122334455667788ULL,
+                                   /*remove=*/1, /*rejoin=*/0,
+                                   buf, sizeof(buf));
+    const uint8_t expect[17] = {
+        0xFE, 0x0C, 0x45, 0xC9,
+        0xCD, 0xAB,              /* src_addr LE = 0xABCD */
+        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  /* ieee LE */
+        0x01,                    /* remove = 1 */
+        0x00,                    /* rejoin = 0 */
+        0x6F                     /* FCS */
+    };
+    CHECK(n == 17);
+    CHECK(memcmp(buf, expect, 17) == 0);
+    /* Verify P4-read offsets (zigbee_mgr.cpp:761):
+     *   ieee = le64(payload[2..9])  → buf[6..13] */
+    CHECK(buf[6] == 0x88 && buf[13] == 0x11);  /* ieee bytes 0 and 7 */
+    CHECK(buf[14] == 0x01);                    /* remove flag */
+    CHECK(buf[15] == 0x00);                    /* rejoin flag */
+}
+
+static void test_leave_ind_rejoin(void) {
+    uint8_t buf[32];
+    /* rejoin=1, remove=0 variant — FCS must change */
+    size_t n = znp_build_leave_ind(0xABCD, 0x1122334455667788ULL,
+                                   /*remove=*/0, /*rejoin=*/1,
+                                   buf, sizeof(buf));
+    CHECK(n == 17);
+    CHECK(buf[14] == 0x00);   /* remove = 0 */
+    CHECK(buf[15] == 0x01);   /* rejoin = 1 */
+    /* FCS = 0x0C^0x45^0xC9^0xCD^0xAB^0x88^0x77^0x66^0x55^0x44^0x33^0x22^0x11^0x00^0x01
+     *     = 0x6F  (remove XOR rejoin cancel — only remove^rejoin bit differs from base) */
+    CHECK(buf[16] == 0x6F);
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main() {
@@ -512,6 +617,12 @@ int main() {
     test_ext_nwk_info();
     test_ext_nwk_info_null_backend();
     test_af_register();
+    /* new (task 4.4) */
+    test_state_change_ind();
+    test_tc_dev_ind();
+    test_tc_dev_ind_overflow();
+    test_leave_ind();
+    test_leave_ind_rejoin();
 
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all znp_dispatch tests passed\n");

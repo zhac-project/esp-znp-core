@@ -76,6 +76,31 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
  * Returns encoded length. */
 size_t znp_build_reset_ind(uint8_t reason, uint8_t *buf, size_t cap);
 
+/* ── Unsolicited AREQ builders (Task 4.4) ────────────────────────────────
+ * Each encodes a full MT frame (SOF…FCS) into buf[0..n-1].
+ * Returns total bytes written, or 0 on overflow.
+ * Task 4.5 signal handler calls these then znp_uart_send_raw(). */
+
+/* ZDO_STATE_CHANGE_IND  AREQ 0x45/0xC0 — 1-byte ZDO state.
+ * dev_state: e.g. 0x09 = DEV_ZB_COORD (zigbee_mgr.cpp on_state_change). */
+size_t znp_build_state_change_ind(uint8_t dev_state, uint8_t *buf, size_t cap);
+
+/* ZDO_TC_DEV_IND  AREQ 0x45/0xCA — device joined/rejoined.
+ * Payload: nwk(2 LE) + ieee(8 LE) + capabilities(1) = 11 bytes.
+ * P4 parser reads nwk at [0..1], ieee at [2..9]; capabilities passed through.
+ * (zigbee_interview.cpp on_tc_dev_ind, payload_len<11 guard). */
+size_t znp_build_tc_dev_ind(uint16_t nwk_addr, uint64_t ieee,
+                             uint8_t capabilities,
+                             uint8_t *buf, size_t cap);
+
+/* ZDO_LEAVE_IND  AREQ 0x45/0xC9 — device left.
+ * Payload: nwk(2 LE) + ieee(8 LE) + remove(1) + rejoin(1) = 12 bytes.
+ * P4 parser: payload_len<10 guard; reads ieee at [2..9].
+ * (zigbee_mgr.cpp on_zdo_leave_ind comment + body). */
+size_t znp_build_leave_ind(uint16_t src_addr, uint64_t ieee,
+                            uint8_t remove, uint8_t rejoin,
+                            uint8_t *buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

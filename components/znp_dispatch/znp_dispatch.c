@@ -325,3 +325,64 @@ size_t znp_build_reset_ind(uint8_t reason, uint8_t *buf, size_t cap) {
     mt_frame_t f = { MT_AREQ(ZNP_SYS), 0x80, 6, pl };
     return mt_encode(&f, buf, cap);
 }
+
+/* ── Task 4.4: unsolicited AREQ builders ────────────────────────────────── */
+
+/* ZDO_STATE_CHANGE_IND  AREQ 0x45/0xC0
+ * Payload: 1 byte ZDO state.
+ * P4 reads: state = f.payload[0]  (zigbee_mgr.cpp:82). */
+size_t znp_build_state_change_ind(uint8_t dev_state, uint8_t *buf, size_t cap) {
+    const uint8_t pl[1] = { dev_state };
+    mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0xC0, 1, pl };
+    return mt_encode(&f, buf, cap);
+}
+
+/* ZDO_TC_DEV_IND  AREQ 0x45/0xCA
+ * Payload: nwk(2 LE) + ieee(8 LE) + capabilities(1) = 11 bytes.
+ * P4 reads: ev.nwk  = le16(payload[0..1])
+ *           ev.ieee = le64(payload[2..9])
+ * (zigbee_interview.cpp:590-592, payload_len<11 guard). */
+size_t znp_build_tc_dev_ind(uint16_t nwk_addr, uint64_t ieee,
+                             uint8_t capabilities,
+                             uint8_t *buf, size_t cap) {
+    uint8_t pl[11];
+    pl[0] = (uint8_t)(nwk_addr & 0xFF);
+    pl[1] = (uint8_t)(nwk_addr >> 8);
+    /* IEEE 8 bytes little-endian */
+    pl[2] = (uint8_t)(ieee);
+    pl[3] = (uint8_t)(ieee >> 8);
+    pl[4] = (uint8_t)(ieee >> 16);
+    pl[5] = (uint8_t)(ieee >> 24);
+    pl[6] = (uint8_t)(ieee >> 32);
+    pl[7] = (uint8_t)(ieee >> 40);
+    pl[8] = (uint8_t)(ieee >> 48);
+    pl[9] = (uint8_t)(ieee >> 56);
+    pl[10] = capabilities;
+    mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0xCA, 11, pl };
+    return mt_encode(&f, buf, cap);
+}
+
+/* ZDO_LEAVE_IND  AREQ 0x45/0xC9
+ * Payload: nwk(2 LE) + ieee(8 LE) + remove(1) + rejoin(1) = 12 bytes.
+ * P4 reads: ieee = le64(payload[2..9])  (zigbee_mgr.cpp:761).
+ * payload_len<10 guard (nwk+ieee mandatory; remove/rejoin always present). */
+size_t znp_build_leave_ind(uint16_t src_addr, uint64_t ieee,
+                            uint8_t remove, uint8_t rejoin,
+                            uint8_t *buf, size_t cap) {
+    uint8_t pl[12];
+    pl[0] = (uint8_t)(src_addr & 0xFF);
+    pl[1] = (uint8_t)(src_addr >> 8);
+    /* IEEE 8 bytes little-endian */
+    pl[2] = (uint8_t)(ieee);
+    pl[3] = (uint8_t)(ieee >> 8);
+    pl[4] = (uint8_t)(ieee >> 16);
+    pl[5] = (uint8_t)(ieee >> 24);
+    pl[6] = (uint8_t)(ieee >> 32);
+    pl[7] = (uint8_t)(ieee >> 40);
+    pl[8] = (uint8_t)(ieee >> 48);
+    pl[9] = (uint8_t)(ieee >> 56);
+    pl[10] = remove;
+    pl[11] = rejoin;
+    mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0xC9, 12, pl };
+    return mt_encode(&f, buf, cap);
+}
