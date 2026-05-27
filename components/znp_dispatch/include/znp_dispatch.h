@@ -1,6 +1,8 @@
 #pragma once
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "mt_proto.h"
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +17,28 @@ extern "C" {
 #define ZNP_VER_MAINT     0x01
 #define ZNP_PING_CAPS     0x0179   /* advertised MT capability bitmap (16-bit LE) */
 
+/* ── NV item IDs (mirrors z-stack-3.x / zigbee_mgr.cpp) ─────────────────── */
+#define ZNP_NV_STARTUP_OPTION  0x0003
+#define ZNP_NV_LOGICAL_TYPE    0x0087
+#define ZNP_NV_PANID           0x0083
+#define ZNP_NV_EXTENDED_PANID  0x002D
+#define ZNP_NV_CHANLIST        0x0084
+#define ZNP_NV_PRECFGKEY       0x0062
+
+/* ── Network-config buffer (filled by buffered NV writes) ────────────────── */
+typedef struct {
+    uint16_t pan_id;         bool have_pan_id;
+    uint8_t  ext_pan_id[8];  bool have_ext_pan_id;
+    uint32_t chan_mask;       bool have_chan_mask;
+    uint8_t  nwk_key[16];    bool have_nwk_key;
+    uint8_t  logical_type;   bool have_logical_type;
+} znp_netcfg_t;
+
+/* Apply one NV write to cfg.  Returns true if accepted (unknown ids silently
+ * accepted+ignored).  Guards against short val buffers — never over-reads. */
+bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,
+                          const uint8_t *val, uint8_t len);
+
 /* Thin seam between pure protocol logic and chip-specific actions, so the
  * dispatcher is host-testable with a fake backend. */
 typedef struct {
@@ -22,10 +46,16 @@ typedef struct {
     void (*request_reset)(void);        /* trigger a reset; RESET_IND follows on boot */
 } znp_backend_t;
 
+/* ── Dispatch context (carries config buffer + backend pointer) ──────────── */
+typedef struct {
+    znp_netcfg_t         cfg;
+    const znp_backend_t *be;
+} znp_dispatch_ctx;
+
 /* Handle one received request frame. If a SRSP must be sent, encodes the full
  * MT response into buf and returns its byte length (>0). Returns 0 when there is
  * no response to send (AREQ-style side-effects like RESET_REQ, or unhandled cmd). */
-size_t znp_dispatch(const mt_frame_t *req, const znp_backend_t *be,
+size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
                     uint8_t *buf, size_t cap);
 
 /* Build a SYS_RESET_IND (AREQ 0x41/0x80) into buf. reason 0x00 = power-up.

@@ -6,11 +6,15 @@
 
 static const char *TAG = "znp_core";
 
+/* Single dispatch context: carries buffered NV config + chip backend.
+ * Lives for the lifetime of app_main; on_frame runs in the UART RX task. */
+static znp_dispatch_ctx s_ctx;
+
 /* RX task hands each received frame here; dispatch builds an encoded response
  * (or 0) and we write it straight back. Runs in the UART RX task context. */
 static void on_frame(const mt_frame_t *f) {
     uint8_t buf[260];
-    size_t n = znp_dispatch(f, znp_ezb_backend(), buf, sizeof(buf));
+    size_t n = znp_dispatch(f, &s_ctx, buf, sizeof(buf));
     if (n > 0) znp_uart_send_raw(buf, n);
 }
 
@@ -27,6 +31,8 @@ void app_main(void) {
         ret = nvs_flash_init_partition("zb_storage");
     }
     ESP_ERROR_CHECK(ret);
+
+    s_ctx.be = znp_ezb_backend();
 
     znp_uart_init(on_frame);
 
