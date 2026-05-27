@@ -11,7 +11,7 @@ static znp_frame_cb_t s_cb = NULL;
 
 #define ZNP_UART_RX_BUF 512
 
-static void rx_task(void *arg);   /* implemented in Task 2.2 */
+static void rx_task(void *arg);
 
 void znp_uart_init(znp_frame_cb_t cb) {
     s_cb = cb;
