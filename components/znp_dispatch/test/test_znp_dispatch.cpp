@@ -325,6 +325,135 @@ static void test_startup_failure(void) {
     CHECK(buf[4] == 0x01);   /* failure status */
 }
 
+/* ── Task 4.3: ZDO_EXT_NWK_INFO (0x25/0x50) ──────────────────────────────── */
+
+static int      s_get_nwk_info_calls = 0;
+static bool     s_nwk_info_return    = true;
+static uint16_t s_nwk_info_panid     = 0x1234;
+static uint16_t s_nwk_info_short     = 0x0000;
+static uint8_t  s_nwk_info_devstate  = 0x09;
+
+static bool fake_get_nwk_info(uint16_t *panid, uint16_t *short_addr, uint8_t *dev_state) {
+    s_get_nwk_info_calls++;
+    *panid      = s_nwk_info_panid;
+    *short_addr = s_nwk_info_short;
+    *dev_state  = s_nwk_info_devstate;
+    return s_nwk_info_return;
+}
+
+/* FAKE_NWK: like FAKE but with get_nwk_info wired */
+static const znp_backend_t FAKE_NWK = {
+    .get_ieee       = fake_get_ieee,
+    .request_reset  = fake_reset,
+    .apply_config   = fake_apply_config,
+    .start_stack    = fake_start_stack,
+    .bdb_commission = fake_bdb_commission,
+    .get_nwk_info   = fake_get_nwk_info,
+    .permit_join    = NULL,
+};
+
+static void test_ext_nwk_info(void) {
+    reset_fake_state();
+    s_get_nwk_info_calls = 0;
+    s_nwk_info_panid     = 0x1234;
+    s_nwk_info_short     = 0x0000;
+    s_nwk_info_devstate  = 0x09;
+
+    /* ZDO_EXT_NWK_INFO: MT_SREQ(ZNP_ZDO)=0x25, cmd1=0x50, no payload */
+    mt_frame_t r = { MT_SREQ(ZNP_ZDO), 0x50, 0, nullptr };
+    uint8_t buf[32];
+    znp_dispatch_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.be = &FAKE_NWK;
+
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    /* SRSP: FE + len(1) + MT_SRSP(ZNP_ZDO)(1) + 0x50(1) + payload(7) + fcs(1) = 12 bytes
+     * P4 reads (zigbee_mgr.cpp:427-429):
+     *   payload[0..1] = shortaddr LE
+     *   payload[2]    = devstate
+     *   payload[3..4] = panid LE
+     *   payload[5..6] = zeros (remaining fields not used by P4)
+     * Expected bytes: FE 07 65 50 00 00 09 34 12 00 00 1D */
+    const uint8_t expect[12] = {0xFE,0x07,0x65,0x50,
+                                 0x00,0x00,  /* shortaddr LE = 0x0000 */
+                                 0x09,       /* devstate = DEV_ZB_COORD */
+                                 0x34,0x12,  /* panid LE = 0x1234 */
+                                 0x00,0x00,  /* padding to reach >= 7 bytes */
+                                 0x1D};      /* FCS */
+    CHECK(n == 12);
+    CHECK(memcmp(buf, expect, 12) == 0);
+    CHECK(s_get_nwk_info_calls == 1);
+    /* Verify individual offsets explicitly (mirrors zigbee_mgr.cpp parse) */
+    CHECK(buf[4] == 0x00 && buf[5] == 0x00);   /* shortaddr */
+    CHECK(buf[6] == 0x09);                      /* devstate */
+    CHECK(buf[7] == 0x34 && buf[8] == 0x12);   /* panid */
+}
+
+static void test_ext_nwk_info_null_backend(void) {
+    /* NULL get_nwk_info → still returns SRSP with zeros, no crash */
+    static const znp_backend_t NULL_NWK_BE = {
+        .get_ieee       = nullptr,
+        .request_reset  = nullptr,
+        .apply_config   = nullptr,
+        .start_stack    = nullptr,
+        .bdb_commission = nullptr,
+        .get_nwk_info   = nullptr,
+        .permit_join    = nullptr,
+    };
+    znp_dispatch_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.be = &NULL_NWK_BE;
+
+    mt_frame_t r = { MT_SREQ(ZNP_ZDO), 0x50, 0, nullptr };
+    uint8_t buf[32];
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    /* Must return a valid SRSP (not 0), all payload bytes zero */
+    CHECK(n == 12);
+    CHECK(buf[0] == 0xFE);
+    CHECK(buf[2] == MT_SRSP(ZNP_ZDO));
+    CHECK(buf[3] == 0x50);
+    /* shortaddr=0, devstate=0, panid=0 */
+    CHECK(buf[4] == 0x00 && buf[5] == 0x00);
+    CHECK(buf[6] == 0x00);
+    CHECK(buf[7] == 0x00 && buf[8] == 0x00);
+}
+
+/* ── Task 4.3: AF_REGISTER (0x24/0x00) ──────────────────────────────────── */
+
+static void test_af_register(void) {
+    /* AF_REGISTER: MT_SREQ(ZNP_AF)=0x24, cmd1=0x00
+     * P4 sends: endpoint(1) + profile(2) + device_id(2) + version(1) +
+     *           latency(1) + in_count(1) + out_count(1) = 9 bytes min
+     * zigbee_mgr.cpp:895: cmd0=MT_SREQ(ZNP_AF), cmd1=0x00
+     * SRSP: MT_SRSP(ZNP_AF)/0x00, 1-byte status=0x00
+     * Expected bytes: FE 01 64 00 00 65 */
+    const uint8_t payload[9] = {
+        0x01,        /* endpoint = 1 */
+        0x04, 0x01,  /* app_profile_id = 0x0104 HA */
+        0x05, 0x00,  /* app_device_id = 0x0005 */
+        0x00,        /* device version */
+        0x00,        /* latency */
+        0x00,        /* in_cluster_count = 0 */
+        0x00,        /* out_cluster_count = 0 */
+    };
+    mt_frame_t r = { MT_SREQ(ZNP_AF), 0x00, sizeof(payload), payload };
+    uint8_t buf[32];
+    znp_dispatch_ctx ctx = make_ctx();
+
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    /* SRSP: FE + len(1) + MT_SRSP(ZNP_AF)(1) + 0x00(1) + status(1) + fcs(1) = 6 bytes
+     * Expected bytes: FE 01 64 00 00 65 */
+    const uint8_t expect[6] = {0xFE, 0x01, 0x64, 0x00, 0x00, 0x65};
+    CHECK(n == 6);
+    CHECK(memcmp(buf, expect, 6) == 0);
+    CHECK(buf[2] == MT_SRSP(ZNP_AF));   /* 0x64 */
+    CHECK(buf[3] == 0x00);
+    CHECK(buf[4] == 0x00);              /* status = success */
+}
+
 /* ── Task 4.2: null-guard — NULL backend members don't crash ─────────────── */
 
 static void test_startup_null_backend(void) {
@@ -379,6 +508,10 @@ int main() {
     test_bdb_set_channel();
     test_startup_null_backend();
     test_startup_failure();
+    /* new (task 4.3) */
+    test_ext_nwk_info();
+    test_ext_nwk_info_null_backend();
+    test_af_register();
 
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all znp_dispatch tests passed\n");

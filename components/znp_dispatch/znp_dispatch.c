@@ -129,6 +129,32 @@ static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
             if (be && be->start_stack && !be->start_stack()) status = 0x01;
             return encode_srsp_sub(ZNP_ZDO, 0x40, &status, 1, buf, cap);
         }
+
+        /* ZDO_EXT_NWK_INFO (0x50):
+         * P4 polls this to learn the formed network (zigbee_mgr.cpp:424-430).
+         * SRSP payload layout (P4 reads exactly these offsets):
+         *   [0..1] = shortaddr LE
+         *   [2]    = dev_state  (DEV_ZB_COORD = 0x09)
+         *   [3..4] = pan_id LE
+         *   [5..6] = zeros (remaining fields, P4 only checks payload_len>=7)
+         * Call get_nwk_info if available; fall through with zeros if NULL. */
+        case 0x50: {
+            uint16_t panid      = 0;
+            uint16_t short_addr = 0;
+            uint8_t  dev_state  = 0;
+            if (be && be->get_nwk_info) be->get_nwk_info(&panid, &short_addr, &dev_state);
+            uint8_t pl[7] = {
+                (uint8_t)(short_addr & 0xFF),        /* [0] shortaddr low  */
+                (uint8_t)(short_addr >> 8),           /* [1] shortaddr high */
+                dev_state,                            /* [2] dev_state      */
+                (uint8_t)(panid & 0xFF),              /* [3] panid low      */
+                (uint8_t)(panid >> 8),                /* [4] panid high     */
+                0x00,                                 /* [5] zeros          */
+                0x00,                                 /* [6] zeros          */
+            };
+            return encode_srsp_sub(ZNP_ZDO, 0x50, pl, sizeof(pl), buf, cap);
+        }
+
         default:
             return 0;
     }
@@ -165,6 +191,29 @@ static size_t dispatch_app_cnf(const mt_frame_t *req, znp_dispatch_ctx *ctx,
     }
 }
 
+/* ── AF subsystem dispatcher ─────────────────────────────────────────────── */
+
+static size_t dispatch_af(const mt_frame_t *req, znp_dispatch_ctx *ctx,
+                          uint8_t *buf, size_t cap) {
+    (void)ctx;
+    const uint8_t status_ok[1] = { 0x00 };
+
+    switch (req->cmd1) {
+        /* AF_REGISTER (0x00):
+         * P4 sends: endpoint(1) + profile(2) + device_id(2) + version(1) +
+         *           latency(1) + in_cluster_count(1) + out_cluster_count(1) + clusters
+         * (zigbee_mgr.cpp:895: MT_SREQ(ZNP_AF)/0x00)
+         * SRSP: 1-byte status=0x00 (success). NCP registers real endpoint at stack
+         * start (Task 4.5); here just ack. status 0xB8=ZApsDuplicateEntry is also
+         * OK in real use but we always return 0x00 from the NCP side. */
+        case 0x00:
+            return encode_srsp_sub(ZNP_AF, 0x00, status_ok, 1, buf, cap);
+
+        default:
+            return 0;
+    }
+}
+
 /* ── znp_dispatch ────────────────────────────────────────────────────────── */
 
 size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
@@ -173,6 +222,7 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
 
     /* Route by subsystem */
     if (req->cmd0 == MT_SREQ(ZNP_ZDO))     return dispatch_zdo(req, ctx, buf, cap);
+    if (req->cmd0 == MT_SREQ(ZNP_AF))      return dispatch_af(req, ctx, buf, cap);
     if (req->cmd0 == MT_SREQ(ZNP_APP_CNF)) return dispatch_app_cnf(req, ctx, buf, cap);
     if (req->cmd0 != MT_SREQ(ZNP_SYS))     return 0;   /* unhandled subsystem */
 
