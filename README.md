@@ -85,6 +85,47 @@ NRESET = `GPIO28` — but every pin is overridable via
 `CONFIG_ZHAC_ZNP_UART_TX_GPIO` / `_RX_GPIO` / `_RST_GPIO`. Match the
 two sides up however your board is wired.
 
+### Reference: Espressif S3-H2 board
+
+Espressif's ESP-Thread-Border-Router / Zigbee-Gateway board carries
+an ESP32-S3 host and an ESP32-H2 radio on one PCB. The hard-wired
+trace between the two is:
+
+```
+H2  TXD0  ─────►  S3  GPIO17    (= S3-side host RX)
+H2  RXD0  ◄─────  S3  GPIO18    (= S3-side host TX)
+```
+
+`TXD0`/`RXD0` are the H2's UART0 pins (default IOMUX `GPIO24` /
+`GPIO23` — verify against the board schematic). On this board, to
+use the link for the MT NCP, configure esp-znp-core on the H2 side:
+
+```
+CONFIG_ZNP_UART_PORT     = 0
+CONFIG_ZNP_UART_TX_GPIO  = 24      # H2 U0TXD (verify schematic)
+CONFIG_ZNP_UART_RX_GPIO  = 23      # H2 U0RXD (verify schematic)
+```
+
+UART0 is normally the ESP-IDF console — redirect it onto the H2's
+USB-Serial-JTAG so logs don't collide with MT frames. In
+`idf.py menuconfig`:
+
+```
+Component config → ESP System Settings → Channel for console output
+    → "USB Serial/JTAG Controller"
+```
+
+The S3-side MT host (your own MT-driving firmware on the S3 of this
+board) pairs symmetrically:
+
+```
+HOST_TX = GPIO18    (→ H2 RXD0)
+HOST_RX = GPIO17    (← H2 TXD0)
+```
+
+The S3 board exposes its USB for flashing/monitor on a separate
+USB-Serial controller, so its console is unaffected.
+
 ### C6 vs H2 — which chip to pick
 
 Both work — the firmware is target-agnostic above the IDF layer.
