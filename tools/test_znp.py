@@ -102,10 +102,12 @@ class Parser:
 
 # ─── console mode ────────────────────────────────────────────────────
 EXPECTED_BOOT_PATTERNS = [
-    re.compile(r"esp-znp-core boot"),
-    re.compile(r"esp-zigbee-lib version"),
-    re.compile(r"UART\d+ up @ 115200 8N1"),
-    re.compile(r"MT-NCP (foundation ready|up: SYS link ready)"),
+    # IDF identity — confirms *this* firmware is what's on the chip.
+    re.compile(r"app_init: Project name:\s+esp-znp-core"),
+    # znp_uart spun up on the configured port + baud.
+    re.compile(r"znp_uart: UART\d+ up @ 115200 8N1"),
+    # app_main reached its final banner — UART wired + boot RESET_IND sent.
+    re.compile(r"esp-znp-core MT-NCP up: SYS link ready, RESET_IND sent"),
 ]
 
 
