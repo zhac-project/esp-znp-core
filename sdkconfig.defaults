@@ -5,3 +5,10 @@ CONFIG_ZB_RADIO_NATIVE=y
 # custom partition table (zb_storage must be NVS in v2.x)
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+# Pin flash size to 4 MB to match the H2-MINI-1 / C6-MINI-1 modules
+# (and the Espressif S3-H2 / C6 dev kits). Without this the binary
+# image header defaults to 2 MB and the bootloader logs:
+#   W (...) spi_flash: Detected size(4096k) larger than the size in
+#                      the binary image header(2048k).
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
