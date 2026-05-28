@@ -55,29 +55,24 @@ static void ezb_request_reset(void)
     esp_restart();   /* reboots → app_main emits SYS_RESET_IND on next boot */
 }
 
-/* ── 1. apply_config ─────────────────────────────────────────────────────── */
+/* ── 1. apply_config ─────────────────────────────────────────────────────── *
+ * BUG FIX (post Phase-4 HW test): the ezb_set_ and ezb_secur_set_ calls
+ * touch stack-internal state that does not exist until esp_zigbee_init()
+ * has run.  Calling them first crashed the chip and triggered a reboot.
+ *
+ * apply_config now CACHES the buffered config; start_stack applies it after
+ * esp_zigbee_init() has succeeded.
+ */
+
+static znp_netcfg_t s_pending_cfg;
+static bool         s_have_pending_cfg = false;
+static bool         s_stack_inited     = false;
 
 static void ezb_apply_config(const znp_netcfg_t *cfg)
 {
     if (!cfg) return;
-
-    if (cfg->have_pan_id) {
-        ezb_set_panid((ezb_panid_t)cfg->pan_id);
-    }
-    if (cfg->have_ext_pan_id) {
-        /* ezb_extpanid_t = ezb_eui64_s; .u8[8] in little-endian byte order */
-        ezb_extpanid_t epid;
-        memcpy(epid.u8, cfg->ext_pan_id, 8);
-        ezb_set_use_extended_panid(&epid);
-    }
-    if (cfg->have_chan_mask) {
-        ezb_set_channel_mask(cfg->chan_mask);
-    }
-    if (cfg->have_nwk_key) {
-        ezb_secur_set_network_key(cfg->nwk_key);
-    }
-    /* Always force coordinator role */
-    ezb_nwk_set_device_type(EZB_NWK_DEVICE_TYPE_COORDINATOR);
+    s_pending_cfg      = *cfg;
+    s_have_pending_cfg = true;
 }
 
 /* ── Signal handler — forward-declared for use in ezb_start_stack ───────── */
@@ -96,29 +91,49 @@ static void mainloop_task(void *arg)
 
 static bool ezb_start_stack(void)
 {
-    /* Build init config: coordinator role */
+    if (s_stack_inited) return true;   /* idempotent — host may resend STARTUP_FROM_APP */
+
+    /* 1. Stack init (must run BEFORE any ezb_set_*) */
     esp_zigbee_config_t cfg = {
         .device_config = {
             .device_type = EZB_NWK_DEVICE_TYPE_COORDINATOR,
         },
     };
-
     esp_err_t err = esp_zigbee_init(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_zigbee_init failed: %d", err);
         return false;
     }
 
-    /* Register the signal handler callback (v2 API — not a weak symbol) */
+    /* 2. Signal handler — register before anything that could emit a signal */
     ezb_err_t herr = ezb_app_signal_add_handler(s_signal_handler);
     if (herr != 0) {
         ESP_LOGE(TAG, "ezb_app_signal_add_handler failed: %d", herr);
         return false;
     }
 
-    /* Register a minimal coordinator endpoint (ep 1, HA profile 0x0104,
-     * device-id 0x0000 = ON_OFF_SWITCH placeholder — coordinator only needs
-     * an AF endpoint to satisfy the stack's device descriptor requirement). */
+    /* 3. Apply the buffered network parameters AFTER init */
+    if (s_have_pending_cfg) {
+        const znp_netcfg_t *c = &s_pending_cfg;
+        if (c->have_pan_id) {
+            ezb_set_panid((ezb_panid_t)c->pan_id);
+        }
+        if (c->have_ext_pan_id) {
+            ezb_extpanid_t epid;
+            memcpy(epid.u8, c->ext_pan_id, 8);
+            ezb_set_use_extended_panid(&epid);
+        }
+        if (c->have_chan_mask) {
+            ezb_set_channel_mask(c->chan_mask);
+        }
+        if (c->have_nwk_key) {
+            ezb_secur_set_network_key(c->nwk_key);
+        }
+    }
+    /* Always force coordinator role */
+    ezb_nwk_set_device_type(EZB_NWK_DEVICE_TYPE_COORDINATOR);
+
+    /* 4. Minimal coordinator endpoint (ep 1, HA profile, device id 0x0000) */
     ezb_af_ep_config_t ep_cfg = {
         .ep_id              = 1,
         .app_profile_id     = EZB_AF_HA_PROFILE_ID,
@@ -128,30 +143,27 @@ static bool ezb_start_stack(void)
     ezb_af_ep_desc_t  ep_desc  = ezb_af_create_endpoint_desc(&ep_cfg);
     ezb_af_device_desc_t dev   = ezb_af_create_device_desc();
     if (!ep_desc || !dev) {
-        /* Partial alloc: free whichever succeeded before returning. */
         if (ep_desc) ezb_af_free_endpoint_desc(ep_desc);
         if (dev)     ezb_af_free_device_desc(dev);
         ESP_LOGE(TAG, "AF descriptor alloc failed");
         return false;
     }
-    /* ep_desc is now owned by dev — do not free separately after this point. */
-    ezb_af_device_add_endpoint_desc(dev, ep_desc);
+    ezb_af_device_add_endpoint_desc(dev, ep_desc);  /* dev owns ep_desc after this */
     ezb_err_t reg_err = ezb_af_device_desc_register(dev);
     if (reg_err != 0) {
-        /* Stack did not take ownership — free the device desc (owns ep_desc). */
         ezb_af_free_device_desc(dev);
         ESP_LOGE(TAG, "ezb_af_device_desc_register failed: %d", reg_err);
         return false;
     }
 
-    /* Start with autostart=false; caller (Task 4.6) drives BDB commissioning */
+    /* 5. autostart=false — host drives BDB via BDB_START_COMMISSIONING */
     err = esp_zigbee_start(false);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_zigbee_start failed: %d", err);
         return false;
     }
 
-    /* Spawn the stack mainloop in a dedicated task (stack-pinned to core 0) */
+    /* 6. Run the stack mainloop in a dedicated task */
     BaseType_t rc = xTaskCreatePinnedToCore(
         mainloop_task, "ezb_main", 8192, NULL, 5, NULL, 0);
     if (rc != pdPASS) {
@@ -159,6 +171,7 @@ static bool ezb_start_stack(void)
         return false;
     }
 
+    s_stack_inited = true;
     return true;
 }
 
