@@ -35,6 +35,21 @@ static const char *TAG = "znp_ezb";
 /* ── Network-up flag, set from signal handler task context ──────────────── */
 static volatile bool s_net_up = false;
 
+/* F32 (FINDINGS.md): ezb_get_nwk_info() runs on the UART RX task and previously
+ * read ezb_nwk_get_panid()/short_address() — stack-internal state — without the
+ * stack lock, racing the mainloop. Instead we snapshot the identity here, in the
+ * signal-handler (mainloop) context, whenever the network comes up, and serve
+ * that cached copy to the RX task. 16-bit aligned loads/stores are atomic on the
+ * RISC-V target, so no lock is needed for the reader. */
+static volatile uint16_t s_cached_panid = 0xFFFFu;
+static volatile uint16_t s_cached_short = 0xFFFEu;
+
+static void cache_nwk_info(void)
+{
+    s_cached_panid = (uint16_t)ezb_nwk_get_panid();
+    s_cached_short = (uint16_t)ezb_nwk_get_short_address();
+}
+
 /* ── IEEE / reset (unchanged from stub) ─────────────────────────────────── */
 
 static void ezb_get_ieee(uint8_t out[8])
@@ -194,8 +209,9 @@ static bool ezb_bdb_commission(uint8_t ezb_mode)
 static bool ezb_get_nwk_info(uint16_t *panid, uint16_t *short_addr,
                               uint8_t *dev_state)
 {
-    if (panid)      *panid      = (uint16_t)ezb_nwk_get_panid();
-    if (short_addr) *short_addr = (uint16_t)ezb_nwk_get_short_address();
+    /* F32: return the mainloop-cached snapshot — no cross-task stack read. */
+    if (panid)      *panid      = s_cached_panid;
+    if (short_addr) *short_addr = s_cached_short;
     /* 0x09 = TI DEV_ZB_COORD once network is up; 0x00 = not started */
     if (dev_state)  *dev_state  = s_net_up ? 0x09u : 0x00u;
     return true;
@@ -238,6 +254,7 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
         /* These signals mean the stack has initialised/rejoined its network.
          * No status check required — the signal itself is the success indicator. */
         s_net_up = true;
+        cache_nwk_info();
         n = znp_build_state_change_ind(0x09u, buf, sizeof(buf));
         if (n) znp_uart_send_raw(buf, n);
         ESP_LOGI(TAG, "signal 0x%04x: device boot/reboot, network up, state_change_ind sent",
@@ -252,6 +269,7 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
             ezb_app_signal_get_params(signal);
         if (p != NULL && p->status == EZB_BDB_STATUS_SUCCESS) {
             s_net_up = true;
+            cache_nwk_info();
             n = znp_build_state_change_ind(0x09u, buf, sizeof(buf));
             if (n) znp_uart_send_raw(buf, n);
             ESP_LOGI(TAG, "signal 0x%04x: formation/steering success, network up, state_change_ind sent",

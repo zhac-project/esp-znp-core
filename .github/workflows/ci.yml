@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# CI for the ESP32-C6 ZNP-clone co-processor firmware (FINDINGS.md F17).
+# Standalone repo (no sibling-component deps). NOTE: authored, not executed
+# in the dev sandbox — validate on first run.
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:release-v6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build esp32c6
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py set-target esp32c6
+          idf.py build
+      - name: Host unit tests (mt_proto / znp_dispatch)
+        shell: bash
+        run: |
+          # Pure-logic component tests build on the host (no target needed).
+          for c in mt_proto znp_dispatch; do
+            if [ -d "components/$c/test" ]; then
+              cmake -B "build-$c" -S "components/$c/test" && cmake --build "build-$c" || exit 1
+              ctest --test-dir "build-$c" --output-on-failure || exit 1
+            fi
+          done

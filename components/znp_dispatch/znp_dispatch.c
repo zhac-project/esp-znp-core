@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
 #include "znp_dispatch.h"
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -260,6 +262,12 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
                 uint16_t nv_id  = le16(pl);
                 /* offset at pl[2..3] — we ignore offset (always 0 from P4) */
                 uint16_t dlen16 = le16(pl + 4);
+                /* F44 (FINDINGS.md): 128 B clamp. Every NV item the P4 writes
+                 * (network key 16 B, PAN id, channel, ...) is far below this, so
+                 * the clamp never truncates a real write — it only bounds the
+                 * copy into znp_netcfg_apply_nv. A >128 B osalNvWriteExt (which
+                 * Z-Stack would accept) is silently truncated: an intentional,
+                 * documented divergence for this NCP, not a Z-Stack-faithful path. */
                 uint8_t  dlen   = (dlen16 > 128) ? 128 : (uint8_t)dlen16;
                 if (plen >= (uint8_t)(6 + dlen)) {
                     znp_netcfg_apply_nv(&ctx->cfg, nv_id, pl + 6, dlen);

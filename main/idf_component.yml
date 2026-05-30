@@ -1,5 +1,7 @@
 dependencies:
+  # F52 (FINDINGS.md): cap the upper bound so a fresh resolve cannot pull an
+  # untested next-major. dependencies.lock still pins the exact build.
   idf:
-    version: ">=6.0"
+    version: ">=6.0,<7.0"
   espressif/esp-zigbee-lib:
-    version: ">=2.0.0"
+    version: ">=2.0.0,<3.0.0"
