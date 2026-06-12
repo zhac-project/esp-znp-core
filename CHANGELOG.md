@@ -47,6 +47,13 @@ follow the platform-wide `vYYYYMMDDVV` scheme.
     signal). Replaced with per-step latches (`s_zb_inited`, `s_handler_added`,
     `s_af_registered`, `s_zb_started`) so a retry RESUMES from the failed step
     instead of restarting bring-up.
+  - **Follow-up (cross-repo / HW soak, not a defect)** — the worker bring-up
+    latency budget is now bounded by the host's wait window. The host's
+    already-configured commissioning path waits for `ZDO_STATE_CHANGE_IND`
+    state=9 only ~10 s (`zhac-components` `zigbee_mgr.cpp:931`), whereas the
+    fresh-commission path waits 20 s. Async worker bring-up must land state=9
+    inside that ~10 s window or the host times out and retries; flagged for a
+    cross-repo / hardware-soak review rather than treated as a defect here.
 
 - **factory-reset / NV STARTUP_OPTION** (CRIT, FINDINGS §12, T33,
   `znp_dispatch.c:71` / `znp_ezb.c`): the NV `STARTUP_OPTION` (0x0003) write was

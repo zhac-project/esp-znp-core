@@ -47,6 +47,8 @@ static volatile bool s_net_up = false;
 static volatile uint16_t s_cached_panid = 0xFFFFu;
 static volatile uint16_t s_cached_short = 0xFFFEu;
 
+/* called only from the signal handler (callback ctx) → intentionally lockless;
+ * see LOCK DISCIPLINE. */
 static void cache_nwk_info(void)
 {
     s_cached_panid = (uint16_t)ezb_nwk_get_panid();
@@ -169,7 +171,9 @@ static bool s_signal_handler(const ezb_app_signal_t *signal);
  * long handler stalled MT-frame parsing + SRSP timeliness. Bring-up now lives
  * on this worker; the RX loop only parses → dispatches-light → replies. The
  * worker is deliberately NOT TWDT-subscribed: after init it blocks forever in
- * esp_zigbee_launch_mainloop(), which would otherwise look like a wedge.
+ * esp_zigbee_launch_mainloop(), which would otherwise look like a wedge. The
+ * accepted cost is that a wedged bring-up BEFORE launch_mainloop is WDT-unwatched
+ * — recovery relies on the host's state-timeout → retry, not a chip hang.
  *
  * Per-step latches (def 4) make each step resume-not-restart on a retry. */
 static bool bring_up_steps(void)
@@ -319,7 +323,9 @@ static bool bring_up_steps(void)
 /* Bring-up + mainloop worker task. Owns the long-running stack work so the RX
  * task (which is TWDT-subscribed) never blocks on flash/init. After a clean
  * bring-up it enters esp_zigbee_launch_mainloop(), which never returns under
- * normal operation. NOT TWDT-subscribed (it legitimately blocks forever). */
+ * normal operation. NOT TWDT-subscribed (it legitimately blocks forever); the
+ * accepted cost is that a wedged bring-up before launch_mainloop is WDT-unwatched,
+ * recovered via the host's state-timeout → retry rather than a chip hang. */
 static void ezb_worker_task(void *arg)
 {
     (void)arg;
@@ -431,6 +437,14 @@ static bool ezb_permit_join(uint8_t dur)
  *
  * Registered via ezb_app_signal_add_handler(). Runs in the stack mainloop task.
  * znp_uart_send_raw() is the independent TX path — safe to call here.
+ *
+ * LOCK DISCIPLINE — this runs INSIDE the stack callback context: the esp-zigbee
+ * lib ALREADY holds the Zigbee lock here, so do NOT call esp_zigbee_lock_acquire
+ * in this handler (re-entry/assert), and do NOT call the cross-task helpers
+ * ezb_bdb_commission / ezb_permit_join from here. Conversely, ANY esp_zb_* / ezb_*
+ * call from a non-callback task (RX task, ezb_main worker) MUST be wrapped in
+ * esp_zigbee_lock_acquire/release. Callbacks never lock; cross-task callers
+ * always lock.
  *
  * Return true  → signal consumed (no further handlers called).
  * Return false → pass to next registered handler.
