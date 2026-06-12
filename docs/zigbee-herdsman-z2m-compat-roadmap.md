@@ -2,7 +2,7 @@
 
 **Status:** scoped, NOT started. Resume from this doc.
 **Investigation date:** 2026-05-28.
-**Target host:** zigbee-herdsman **v10.0.5** (`/home/user/webapp/zigbee/zigbee-herdsman`),
+**Target host:** zigbee-herdsman **v10.0.5** (npm `zigbee-herdsman`, github.com/Koenkk/zigbee-herdsman),
 the Zigbee library that drives zigbee2mqtt. The Z-Stack adapter lives at
 `src/adapter/z-stack/`; the protocol surface this firmware must match is
 the TI Z-Stack 3.x **MT (Monitor & Test)** UART protocol — same wire as
@@ -112,7 +112,7 @@ execution like Phase 4, hardware-validated against a real z2m install.
 
 ## 7. References
 
-- zigbee-herdsman Z-Stack adapter: `/home/user/webapp/zigbee/zigbee-herdsman/src/adapter/z-stack/`
+- zigbee-herdsman Z-Stack adapter: `src/adapter/z-stack/` (in the zigbee-herdsman package)
   - `znp/definition.ts` — full MT command table with parameter layouts (the source of truth for SREQ/SRSP/AREQ payloads).
   - `znp/buffaloZnp.ts` — typed (de)serialiser for the parameter primitives.
   - `constants/common.ts` — `NvItemsIds` enum + Z-Stack version codes.
