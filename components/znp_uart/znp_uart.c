@@ -23,7 +23,24 @@ static QueueHandle_t s_uart_q = NULL;   /* F32: UART event queue (overrun detect
 
 static void rx_task(void *arg);
 
+/* P6-T37 (FINDINGS §12 def 3): SINGLETON CONTRACT.
+ * This driver is intentionally a process-wide singleton with no deinit. The
+ * co-processor firmware brings the UART up exactly once at boot (from app_main)
+ * and keeps it for the lifetime of the device; nothing ever tears it down, so a
+ * znp_uart_deinit (vTaskDelete + uart_driver_delete + vSemaphoreDelete) would be
+ * dead machinery that only adds teardown-race surface. We therefore DOCUMENT the
+ * singleton rather than build deinit, and guard against accidental double-init
+ * below — a second znp_uart_init() would leak the TX mutex, spawn a second RX
+ * task racing the first on the same event queue, and re-install the driver.
+ * The guard is the TX mutex handle: it is NULL only before the first init. */
+static bool s_inited = false;
+
 void znp_uart_init(znp_frame_cb_t cb) {
+    if (s_inited) {
+        ESP_LOGW(TAG, "znp_uart_init called twice — ignoring (singleton, init-once)");
+        return;
+    }
+    s_inited = true;
     s_cb = cb;
     const uart_config_t cfg = {
         .baud_rate = CONFIG_ZNP_UART_BAUD,
@@ -51,6 +68,10 @@ void znp_uart_init(znp_frame_cb_t cb) {
     BaseType_t rc = xTaskCreate(rx_task, "znp_uart_rx", 8192, NULL, 10, NULL);
     if (rc != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate(znp_uart_rx) failed: %d — NCP RX is DEAD", (int)rc);
+        /* P6-T37: clear the singleton flag so a caller may retry init and get a
+         * working RX task (the driver+mutex are already up; the retry guard
+         * above tolerates the already-installed driver via this reset path). */
+        s_inited = false;
         return;
     }
     ESP_LOGI(TAG, "UART%d up @ %d 8N1 (tx=%d rx=%d)", PORT, CONFIG_ZNP_UART_BAUD,
@@ -107,13 +128,36 @@ static void rx_task(void *arg) {
         }
         case UART_FIFO_OVF:
         case UART_BUFFER_FULL:
-            /* F32: RX overrun — bytes were lost, so the in-flight MT frame is
-             * unrecoverable. Flush the driver buffers, drop queued events, and
-             * reset the parser so we resync on the next SOF rather than feed it
-             * a corrupt partial frame. */
-            ESP_LOGW(TAG, "UART RX overrun (event %d) — flush + parser resync", (int)ev.type);
-            uart_flush_input(PORT);
+            /* F32 + P6-T37 (FINDINGS §12 def 1): RX overrun — bytes were lost,
+             * so the in-flight MT frame is unrecoverable.
+             *
+             * ORDER MATTERS: xQueueReset() FIRST, then uart_flush_input().
+             * If we flushed the driver ring before draining the event queue,
+             * any bytes that arrive in the window between flush and reset stay
+             * in the ring while their UART_DATA event is dropped by the reset —
+             * a permanent read-accounting lag where every later event then
+             * reads those stale bytes first, pushing SRSPs past the host's
+             * 2-3 s budget. Draining the queue first, then flushing, guarantees
+             * the ring and the event accounting are both empty on resync.
+             *
+             * Also reset the parser so a half-consumed frame doesn't poison the
+             * next parse — we resync on the next SOF, not on a corrupt partial. */
+            ESP_LOGW(TAG, "UART RX overrun (event %d) — queue-reset + flush + parser resync", (int)ev.type);
             xQueueReset(s_uart_q);
+            uart_flush_input(PORT);
+            mt_parser_reset(&parser);
+            break;
+        case UART_FRAME_ERR:
+        case UART_PARITY_ERR:
+            /* P6-T37 (FINDINGS §12 def 2): a framing or parity error means the
+             * byte stream is corrupt at the wire level. Previously these fell
+             * into default and were ignored, letting noise bytes stream into the
+             * parser guarded only by the weak XOR-8 FCS (1/256 false-accept — a
+             * false-accepted SYS RESET 0x21/0x00 would trigger a spurious reboot).
+             * Treat them like an overrun: flush the corrupt input + reset the
+             * parser so we resync on the next clean SOF. */
+            ESP_LOGW(TAG, "UART framing/parity error (event %d) — flush + parser resync", (int)ev.type);
+            uart_flush_input(PORT);
             mt_parser_reset(&parser);
             break;
         default:

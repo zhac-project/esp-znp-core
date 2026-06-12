@@ -8,6 +8,46 @@ follow the platform-wide `vYYYYMMDDVV` scheme.
 
 ### Security
 
+- **UART RX recovery / MT parser robustness** (MED/LOW, FINDINGS §12, T37,
+  `znp_uart.c` / `mt_proto.cpp`): hardened the UART overrun/framing-error
+  recovery and the MT frame parser against garbled/noisy input so a corrupt
+  byte stream resyncs cleanly without blowing the host's 2-3 s SRSP budget or
+  feeding the weak XOR-8 FCS a false-accept. T35's RX-task stack/TWDT/xTaskCreate
+  changes are preserved unchanged.
+  - **MED — overrun recovery order** (`znp_uart.c:108`, `UART_FIFO_OVF` /
+    `UART_BUFFER_FULL`): the recovery flushed the driver input *before*
+    `xQueueReset(s_uart_q)`, so bytes arriving in the flush→reset window stayed
+    in the ring after their event was dropped — a permanent read-accounting lag
+    where every later event read stale bytes first, delaying SRSPs. Swapped the
+    order: `xQueueReset()` FIRST, then `uart_flush_input()`, then
+    `mt_parser_reset()` so a half-consumed frame can't poison the next parse.
+  - **MED — FRAME_ERR / PARITY_ERR ignored** (`znp_uart.c`, new
+    `UART_FRAME_ERR` / `UART_PARITY_ERR` case): these fell into `default` and
+    were ignored, streaming wire-corrupt noise into the parser guarded only by
+    the 1/256 XOR-8 FCS (a false-accepted SYS RESET 0x21/0x00 would trigger a
+    spurious `esp_restart`). Now handled like an overrun — `uart_flush_input()`
+    + `mt_parser_reset()` to resync on the next clean SOF.
+  - **MED — accidental singleton / no deinit** (`znp_uart_init`): the driver is
+    documented as a process-wide init-once singleton (the co-processor brings the
+    UART up once at boot and never tears it down; a deinit would be dead teardown
+    surface), now guarded by an `s_inited` flag against accidental double-init
+    (which would leak the TX mutex and spawn a second RX task racing the first on
+    the same event queue). The flag is cleared on the `xTaskCreate`-failure path
+    so init may be retried.
+  - **LOW — parser reject paths lost a valid SOF** (`mt_proto.cpp`, new
+    `mt_parser_resync()` helper, LEN-reject + FCS-fail paths): both reject paths
+    consumed the offending byte without re-testing it as a SOF, so an `0xFE` that
+    was actually the *next* frame's start-of-frame was discarded and that valid
+    frame lost. Resync is now byte-preserving — reset to SOF-hunt, then if the
+    current byte is `MT_SOF` advance to the length-pending state.
+  - **LOW — `mt_encode` NULL deref** (`mt_proto.cpp:12`): dereferenced
+    `f->payload` with no guard when `payload_len > 0` (public-API boundary). Now
+    returns 0 when `payload == NULL && payload_len > 0` (NULL+len-0 still encodes,
+    e.g. SYS_PING).
+  - Host tests (`mt_proto/test/test_mt_proto.cpp`): added LEN-reject-then-valid-SOF,
+    FCS-fail-then-valid-SOF (valid frame NOT lost), non-SOF-reject regression
+    guards, and `mt_encode(NULL, len>0)→0` cases. Full suite green.
+
 - **Commissioning signal / network-state integrity** (HIGH/MED/LOW, FINDINGS
   §12, T36, `znp_ezb.c` / `znp_dispatch.c` / `app_main.c`): the signal handler and
   net-state tracking reported a dead network as up and left the network key in
