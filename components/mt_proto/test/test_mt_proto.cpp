@@ -188,12 +188,39 @@ static void test_parser_resync() {
     CHECK(dd == 1 && out.cmd0 == 0x21);
 }
 
+/* P6-T37 def 4: forward-progress invariant under a 0xFE flood. A run of SOF
+ * bytes drives SOF-hunt -> LEN-pending repeatedly (LEN=0xFE over-length ->
+ * resync, byte is SOF -> back to LEN-pending). Each feed must consume exactly
+ * one byte and return 0 (no false emit, no spin / re-processing of a byte), and
+ * a valid frame immediately after the flood must still decode. This locks the
+ * one-byte-per-call invariant a parser refactor could silently break. */
+static void test_parser_flood_forward_progress() {
+    mt_parser_t p; mt_parser_reset(&p);
+    mt_frame_t out;
+    const uint8_t ping[5] = {0xFE, 0x00, 0x21, 0x01, 0x20};
+
+    /* 1000 consecutive SOF bytes: every call returns 0, none emits a frame. */
+    for (int i = 0; i < 1000; i++) {
+        CHECK(mt_parser_feed(&p, 0xFE, &out) == 0);
+    }
+    /* The trailing 0xFE left the parser in LEN-pending. ping[0]=0xFE is another
+     * over-length LEN -> resync (byte is SOF) -> LEN-pending again; then the
+     * real LEN/CMD0/CMD1/FCS complete the frame. Valid frame NOT lost. */
+    CHECK(mt_parser_feed(&p, ping[0], &out) == 0);  /* LEN=0xFE reject; SOF -> re-armed */
+    CHECK(mt_parser_feed(&p, ping[1], &out) == 0);  /* LEN=0 */
+    CHECK(mt_parser_feed(&p, ping[2], &out) == 0);  /* CMD0 */
+    CHECK(mt_parser_feed(&p, ping[3], &out) == 0);  /* CMD1 */
+    CHECK(mt_parser_feed(&p, ping[4], &out) == 1);  /* FCS -> frame */
+    CHECK(out.cmd0 == 0x21 && out.cmd1 == 0x01 && out.payload_len == 0);
+}
+
 int main() {
     test_fcs();
     test_encode();
     test_decode();
     test_parser();
     test_parser_resync();
+    test_parser_flood_forward_progress();
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all mt_proto tests passed\n");
     return 0;

@@ -40,6 +40,10 @@ void znp_uart_init(znp_frame_cb_t cb) {
         ESP_LOGW(TAG, "znp_uart_init called twice — ignoring (singleton, init-once)");
         return;
     }
+    /* P6-T37: set BEFORE uart_driver_install is safe — every install step below
+     * is ESP_ERROR_CHECK, so any failure aborts the process (no partial-init
+     * survives to observe a stale-true flag). Only the recoverable xTaskCreate
+     * failure further down clears it back to false to permit a retry. */
     s_inited = true;
     s_cb = cb;
     const uart_config_t cfg = {

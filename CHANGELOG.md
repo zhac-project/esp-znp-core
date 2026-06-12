@@ -46,7 +46,10 @@ follow the platform-wide `vYYYYMMDDVV` scheme.
     e.g. SYS_PING).
   - Host tests (`mt_proto/test/test_mt_proto.cpp`): added LEN-reject-then-valid-SOF,
     FCS-fail-then-valid-SOF (valid frame NOT lost), non-SOF-reject regression
-    guards, and `mt_encode(NULL, len>0)→0` cases. Full suite green.
+    guards, a 0xFE-flood forward-progress guard (1000 SOF bytes → one byte per
+    feed, no spin / no false emit, valid frame after the flood still decodes —
+    locks the one-byte-per-call invariant against a parser refactor), and
+    `mt_encode(NULL, len>0)→0` cases. Full suite green.
 
 - **Commissioning signal / network-state integrity** (HIGH/MED/LOW, FINDINGS
   §12, T36, `znp_ezb.c` / `znp_dispatch.c` / `app_main.c`): the signal handler and
