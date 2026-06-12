@@ -18,9 +18,10 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 /* esp-zigbee-lib v2.0.1 native API */
-#include "esp_zigbee.h"             /* esp_zigbee_init/start/launch_mainloop, esp_zigbee_config_t */
+#include "esp_zigbee.h"             /* esp_zigbee_init/start/launch_mainloop, esp_zigbee_lock_acquire/release, esp_zigbee_config_t */
 #include "ezbee/app_signals.h"      /* ezb_app_signal_*, EZB_BDB_SIGNAL_*, EZB_ZDO_SIGNAL_* */
 #include "ezbee/af.h"               /* ezb_af_create_endpoint_desc, ezb_af_create_device_desc, etc. */
 #include "ezbee/bdb.h"              /* ezb_bdb_start_top_level_commissioning, ezb_bdb_open_network */
@@ -133,7 +134,23 @@ static bool consume_factory_new_flag(void)
 
 static znp_netcfg_t s_pending_cfg;
 static bool         s_have_pending_cfg = false;
-static bool         s_stack_inited     = false;
+
+/* ── def 4 / FINDINGS §12 HIGH — per-step init latches ───────────────────── *
+ * The old single `s_stack_inited` flag was only set true at the very END of
+ * bring-up. Any failure after esp_zigbee_init (handler add / AF reg / start /
+ * task create) left it false, so a host STARTUP_FROM_APP retry re-ran
+ * esp_zigbee_init on an already-initialised stack and re-registered the signal
+ * handler → double-init UB + duplicate AREQ emission per signal. We now latch
+ * each step independently so a retry RESUMES from the first incomplete step
+ * rather than restarting from scratch. All written/read only on the worker task
+ * (do_bring_up) except s_worker_started, which is the RX-task → worker handoff
+ * guard (see ezb_start_stack). */
+static bool s_zb_inited      = false;   /* esp_zigbee_init done                */
+static bool s_handler_added  = false;   /* ezb_app_signal_add_handler done     */
+static bool s_af_registered  = false;   /* AF endpoint descriptor registered   */
+static bool s_zb_started     = false;   /* esp_zigbee_start(false) done        */
+static volatile bool s_worker_started = false;  /* bring-up worker task spawned */
+static volatile bool s_bring_up_ok    = false;  /* worker reached launch_mainloop */
 
 static void ezb_apply_config(const znp_netcfg_t *cfg)
 {
@@ -142,37 +159,33 @@ static void ezb_apply_config(const znp_netcfg_t *cfg)
     s_have_pending_cfg = true;
 }
 
-/* ── Signal handler — forward-declared for use in ezb_start_stack ───────── */
+/* ── Signal handler — forward-declared for use in the bring-up worker ────── */
 static bool s_signal_handler(const ezb_app_signal_t *signal);
 
-/* ── Mainloop trampoline task ────────────────────────────────────────────── */
-static void mainloop_task(void *arg)
+/* ── Stack bring-up — runs on the dedicated worker task, NOT the RX task ──── *
+ * def 3 / FINDINGS §12 HIGH: the entire ZBOSS bring-up (NVRAM erase, init, AF
+ * registration, start) used to run on the 4 KB TWDT-subscribed UART RX task. A
+ * slow flash op there could trip the 5 s TWDT panic mid-commissioning, and any
+ * long handler stalled MT-frame parsing + SRSP timeliness. Bring-up now lives
+ * on this worker; the RX loop only parses → dispatches-light → replies. The
+ * worker is deliberately NOT TWDT-subscribed: after init it blocks forever in
+ * esp_zigbee_launch_mainloop(), which would otherwise look like a wedge.
+ *
+ * Per-step latches (def 4) make each step resume-not-restart on a retry. */
+static bool bring_up_steps(void)
 {
-    (void)arg;
-    /* Blocks until stack shuts down (never in normal operation) */
-    esp_zigbee_launch_mainloop();
-    vTaskDelete(NULL);
-}
-
-/* ── 2. start_stack ──────────────────────────────────────────────────────── */
-
-static bool ezb_start_stack(void)
-{
-    if (s_stack_inited) return true;   /* idempotent — host may resend STARTUP_FROM_APP */
-
-    /* 0. Factory-reset consume (def 1 / FINDINGS §12 CRIT).
+    /* 0. Factory-reset consume (T33 / FINDINGS §12 CRIT).
      * !!! MUST run before esp_zigbee_init — DO NOT move below it. !!!
-     * P6-T35 will relocate this whole bring-up off the UART RX task onto a
-     * mainloop/worker. When it does, KEEP this erase running unconditionally
-     * BEFORE esp_zigbee_init: the stack reads the zb_storage NVRAM during init,
-     * so wiping it afterward would not give the host the blank radio it asked
-     * for via STARTUP_OPTION. esp_restart() preserves zb_storage; this is the
-     * only point at which the prior network/PAN/key can actually be cleared. */
-    if (consume_factory_new_flag()) {
+     * P6-T35 relocated this bring-up off the UART RX task onto this worker; the
+     * erase STAYS unconditionally BEFORE esp_zigbee_init: the stack reads the
+     * zb_storage NVRAM during init, so wiping it afterward would not give the
+     * host the blank radio it asked for via STARTUP_OPTION. esp_restart()
+     * preserves zb_storage; this is the only point the prior PAN/key can clear.
+     * Gated on !s_zb_inited so a post-init retry doesn't re-erase a live NVRAM. */
+    if (!s_zb_inited && consume_factory_new_flag()) {
         /* app_main already nvs_flash_init_partition("zb_storage")'d this
          * partition, so erase + re-init here operates on an already-mounted,
-         * active partition — that is safe (erase deinits then re-formats it).
-         * (Closes the reasoning gap for the P6-T35 relocation.) */
+         * active partition — that is safe (erase deinits then re-formats it). */
         esp_err_t eerr = nvs_flash_erase_partition(ZNP_ZB_NVRAM_PARTITION);
         if (eerr != ESP_OK) {
             /* CRIT: a failed erase means the prior PAN/network-key survives. We
@@ -200,94 +213,176 @@ static bool ezb_start_stack(void)
         }
     }
 
-    /* 1. Stack init (must run BEFORE any ezb_set_*) */
-    esp_zigbee_config_t cfg = {
-        .device_config = {
-            .device_type = EZB_NWK_DEVICE_TYPE_COORDINATOR,
-        },
-    };
-    esp_err_t err = esp_zigbee_init(&cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_zigbee_init failed: %d", err);
-        return false;
-    }
-
-    /* 2. Signal handler — register before anything that could emit a signal */
-    ezb_err_t herr = ezb_app_signal_add_handler(s_signal_handler);
-    if (herr != 0) {
-        ESP_LOGE(TAG, "ezb_app_signal_add_handler failed: %d", herr);
-        return false;
-    }
-
-    /* 3. Apply the buffered network parameters AFTER init */
-    if (s_have_pending_cfg) {
-        const znp_netcfg_t *c = &s_pending_cfg;
-        if (c->have_pan_id) {
-            ezb_set_panid((ezb_panid_t)c->pan_id);
+    /* 1. Stack init (must run BEFORE any ezb_set_*) — latched against re-init. */
+    if (!s_zb_inited) {
+        esp_zigbee_config_t cfg = {
+            .device_config = {
+                .device_type = EZB_NWK_DEVICE_TYPE_COORDINATOR,
+            },
+        };
+        esp_err_t err = esp_zigbee_init(&cfg);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_zigbee_init failed: %d", err);
+            return false;
         }
-        if (c->have_ext_pan_id) {
-            ezb_extpanid_t epid;
-            memcpy(epid.u8, c->ext_pan_id, 8);
-            ezb_set_use_extended_panid(&epid);
+        s_zb_inited = true;
+    }
+
+    /* 2. Signal handler — register once (re-registering would double-emit every
+     *    AREQ per signal). Latched. */
+    if (!s_handler_added) {
+        ezb_err_t herr = ezb_app_signal_add_handler(s_signal_handler);
+        if (herr != 0) {
+            ESP_LOGE(TAG, "ezb_app_signal_add_handler failed: %d", herr);
+            return false;
         }
-        if (c->have_chan_mask) {
-            ezb_set_channel_mask(c->chan_mask);
+        s_handler_added = true;
+    }
+
+    /* 3. Apply the buffered network parameters AFTER init.
+     *    These setters mutate stack-internal state; on this worker the mainloop
+     *    is not yet running (launch happens in step 6), but the lib task may
+     *    already be schedulable, so hold the Zigbee lock defensively per the
+     *    esp_zigbee.h:175 cross-task mandate. AF registration (step 4) is
+     *    likewise wrapped. */
+    if (!s_af_registered) {
+        if (!esp_zigbee_lock_acquire(portMAX_DELAY)) {
+            ESP_LOGE(TAG, "bring-up: lock acquire failed (config/AF)");
+            return false;
         }
-        if (c->have_nwk_key) {
-            ezb_secur_set_network_key(c->nwk_key);
+        if (s_have_pending_cfg) {
+            const znp_netcfg_t *c = &s_pending_cfg;
+            if (c->have_pan_id) {
+                ezb_set_panid((ezb_panid_t)c->pan_id);
+            }
+            if (c->have_ext_pan_id) {
+                ezb_extpanid_t epid;
+                memcpy(epid.u8, c->ext_pan_id, 8);
+                ezb_set_use_extended_panid(&epid);
+            }
+            if (c->have_chan_mask) {
+                ezb_set_channel_mask(c->chan_mask);
+            }
+            if (c->have_nwk_key) {
+                ezb_secur_set_network_key(c->nwk_key);
+            }
         }
-    }
-    /* Always force coordinator role */
-    ezb_nwk_set_device_type(EZB_NWK_DEVICE_TYPE_COORDINATOR);
+        /* Always force coordinator role */
+        ezb_nwk_set_device_type(EZB_NWK_DEVICE_TYPE_COORDINATOR);
 
-    /* 4. Minimal coordinator endpoint (ep 1, HA profile, device id 0x0000) */
-    ezb_af_ep_config_t ep_cfg = {
-        .ep_id              = 1,
-        .app_profile_id     = EZB_AF_HA_PROFILE_ID,
-        .app_device_id      = 0x0000,
-        .app_device_version = 0,
-    };
-    ezb_af_ep_desc_t  ep_desc  = ezb_af_create_endpoint_desc(&ep_cfg);
-    ezb_af_device_desc_t dev   = ezb_af_create_device_desc();
-    if (!ep_desc || !dev) {
-        if (ep_desc) ezb_af_free_endpoint_desc(ep_desc);
-        if (dev)     ezb_af_free_device_desc(dev);
-        ESP_LOGE(TAG, "AF descriptor alloc failed");
-        return false;
-    }
-    ezb_af_device_add_endpoint_desc(dev, ep_desc);  /* dev owns ep_desc after this */
-    ezb_err_t reg_err = ezb_af_device_desc_register(dev);
-    if (reg_err != 0) {
-        ezb_af_free_device_desc(dev);
-        ESP_LOGE(TAG, "ezb_af_device_desc_register failed: %d", reg_err);
-        return false;
-    }
-
-    /* 5. autostart=false — host drives BDB via BDB_START_COMMISSIONING */
-    err = esp_zigbee_start(false);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_zigbee_start failed: %d", err);
-        return false;
+        /* 4. Minimal coordinator endpoint (ep 1, HA profile, device id 0x0000) */
+        ezb_af_ep_config_t ep_cfg = {
+            .ep_id              = 1,
+            .app_profile_id     = EZB_AF_HA_PROFILE_ID,
+            .app_device_id      = 0x0000,
+            .app_device_version = 0,
+        };
+        ezb_af_ep_desc_t  ep_desc  = ezb_af_create_endpoint_desc(&ep_cfg);
+        ezb_af_device_desc_t dev   = ezb_af_create_device_desc();
+        if (!ep_desc || !dev) {
+            if (ep_desc) ezb_af_free_endpoint_desc(ep_desc);
+            if (dev)     ezb_af_free_device_desc(dev);
+            esp_zigbee_lock_release();
+            ESP_LOGE(TAG, "AF descriptor alloc failed");
+            return false;
+        }
+        ezb_af_device_add_endpoint_desc(dev, ep_desc);  /* dev owns ep_desc after this */
+        ezb_err_t reg_err = ezb_af_device_desc_register(dev);
+        if (reg_err != 0) {
+            ezb_af_free_device_desc(dev);
+            esp_zigbee_lock_release();
+            ESP_LOGE(TAG, "ezb_af_device_desc_register failed: %d", reg_err);
+            return false;
+        }
+        esp_zigbee_lock_release();
+        s_af_registered = true;
     }
 
-    /* 6. Run the stack mainloop in a dedicated task */
-    BaseType_t rc = xTaskCreatePinnedToCore(
-        mainloop_task, "ezb_main", 8192, NULL, 5, NULL, 0);
-    if (rc != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreatePinnedToCore failed");
-        return false;
+    /* 5. autostart=false — host drives BDB via BDB_START_COMMISSIONING. Latched. */
+    if (!s_zb_started) {
+        if (!esp_zigbee_lock_acquire(portMAX_DELAY)) {
+            ESP_LOGE(TAG, "bring-up: lock acquire failed (start)");
+            return false;
+        }
+        esp_err_t err = esp_zigbee_start(false);
+        esp_zigbee_lock_release();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_zigbee_start failed: %d", err);
+            return false;
+        }
+        s_zb_started = true;
     }
 
-    s_stack_inited = true;
     return true;
+}
+
+/* Bring-up + mainloop worker task. Owns the long-running stack work so the RX
+ * task (which is TWDT-subscribed) never blocks on flash/init. After a clean
+ * bring-up it enters esp_zigbee_launch_mainloop(), which never returns under
+ * normal operation. NOT TWDT-subscribed (it legitimately blocks forever). */
+static void ezb_worker_task(void *arg)
+{
+    (void)arg;
+    if (!bring_up_steps()) {
+        /* A step failed; the per-step latches recorded how far we got. Leave
+         * s_bring_up_ok false and exit so a host STARTUP_FROM_APP retry can
+         * re-spawn the worker and RESUME from the failed step. */
+        ESP_LOGE(TAG, "stack bring-up failed — worker exiting, retry will resume");
+        s_worker_started = false;   /* allow re-spawn on retry */
+        vTaskDelete(NULL);
+        return;
+    }
+    s_bring_up_ok = true;
+    ESP_LOGI(TAG, "stack bring-up complete — entering mainloop");
+    esp_zigbee_launch_mainloop();   /* blocks until shutdown (never in normal op) */
+    vTaskDelete(NULL);
+}
+
+/* ── 2. start_stack ──────────────────────────────────────────────────────── *
+ * Runs on the UART RX task (0x40 ZDO_STARTUP_FROM_APP dispatch). def 3: it no
+ * longer performs the bring-up itself — it spawns ezb_worker_task once and
+ * returns IMMEDIATELY so the 0x40 SRSP goes out promptly (the host's
+ * znp_sreq_retry waits ≤3 s × 3 for the SRSP, then separately polls for the
+ * async ZDO_STATE_CHANGE_IND state=9 emitted later by the signal handler — so
+ * an immediate-accept SRSP + async readiness is exactly what the host expects;
+ * verified in zhac-components zigbee_mgr.cpp coordinator_start). Returning true
+ * here means "accepted/started", not "network up". */
+static bool ezb_start_stack(void)
+{
+    /* Idempotent: once the worker is spawned and the bring-up succeeded, a
+     * resent STARTUP_FROM_APP is a no-op success. While the worker is still
+     * running its first pass, also no-op (don't double-spawn). */
+    if (s_worker_started) return true;
+
+    s_worker_started = true;   /* claim the spawn before creating the task */
+    BaseType_t rc = xTaskCreatePinnedToCore(
+        ezb_worker_task, "ezb_main", 8192, NULL, 5, NULL, 0);
+    if (rc != pdPASS) {
+        /* def 3: check the create return (was previously ignored elsewhere).
+         * Clear the guard so the host can retry the spawn. */
+        s_worker_started = false;
+        ESP_LOGE(TAG, "xTaskCreatePinnedToCore(ezb_main) failed: %d", (int)rc);
+        return false;
+    }
+    return true;   /* accepted — bring-up proceeds asynchronously on the worker */
 }
 
 /* ── 3. bdb_commission ───────────────────────────────────────────────────── */
 
 static bool ezb_bdb_commission(uint8_t ezb_mode)
 {
+    /* def 1 / FINDINGS §12 CRIT: this runs on the UART RX task while the
+     * esp-zigbee mainloop task is live — a cross-task esp_zb_* call. The lib
+     * header (esp_zigbee.h:175) makes holding the Zigbee lock MANDATORY for any
+     * SDK API invoked OUTSIDE a stack callback. Without it the BDB scheduler is
+     * mutated concurrently with the mainloop → data race. Wrap the call. */
+    if (!esp_zigbee_lock_acquire(portMAX_DELAY)) {
+        ESP_LOGE(TAG, "bdb_commission: lock acquire failed");
+        return false;
+    }
     ezb_err_t err = ezb_bdb_start_top_level_commissioning(
         (ezb_bdb_comm_mode_mask_t)ezb_mode);
+    esp_zigbee_lock_release();
     if (err != 0) {
         ESP_LOGE(TAG, "ezb_bdb_start_top_level_commissioning(%02x) err %d",
                  ezb_mode, err);
@@ -313,7 +408,15 @@ static bool ezb_get_nwk_info(uint16_t *panid, uint16_t *short_addr,
 
 static bool ezb_permit_join(uint8_t dur)
 {
+    /* def 2 / FINDINGS §12 HIGH: same cross-task class as bdb_commission. Now
+     * LIVE (T34 wired 0x36 → permit_join → here), reached from the RX task while
+     * the mainloop runs. Hold the Zigbee lock (esp_zigbee.h:175 mandate). */
+    if (!esp_zigbee_lock_acquire(portMAX_DELAY)) {
+        ESP_LOGE(TAG, "permit_join: lock acquire failed");
+        return false;
+    }
     ezb_err_t err = ezb_bdb_open_network(dur);
+    esp_zigbee_lock_release();
     if (err != 0) {
         ESP_LOGE(TAG, "ezb_bdb_open_network(%u) err %d", dur, err);
         return false;

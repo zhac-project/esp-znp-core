@@ -8,6 +8,46 @@ follow the platform-wide `vYYYYMMDDVV` scheme.
 
 ### Security
 
+- **Unlocked cross-task stack calls + bring-up on the RX task** (CRIT, FINDINGS
+  §12, T35, `znp_ezb.c` / `znp_uart.c`): the Zigbee stack task/lock structure was
+  unsafe in four ways.
+  - **CRIT — unlocked BDB commissioning** (`znp_ezb.c` `ezb_bdb_commission`):
+    `ezb_bdb_start_top_level_commissioning` was called from the UART RX task
+    while the esp-zigbee mainloop task ran, with NO lock held — a data race in
+    the stack's BDB scheduler. The lib header (`esp_zigbee.h:175`) makes holding
+    the Zigbee lock MANDATORY for any SDK API invoked outside a stack callback.
+    Now wrapped in `esp_zigbee_lock_acquire(portMAX_DELAY)` /
+    `esp_zigbee_lock_release` (F32/`ae4adef` had only fixed the READ path via a
+    mainloop-cached identity; the WRITE entry points stayed unlocked).
+  - **HIGH — unlocked `open_network`** (`ezb_permit_join` →
+    `ezb_bdb_open_network`): same cross-task class, now LIVE after T34 wired the
+    0x36 permit-join handler. Same lock fix. The bring-up config/AF setters
+    (`ezb_set_*`, `ezb_secur_set_network_key`, `ezb_af_*`) and `esp_zigbee_start`
+    are likewise lock-wrapped defensively.
+  - **HIGH — stack bring-up on the RX task** (`ezb_start_stack` →
+    `ezb_worker_task`): the entire ZBOSS bring-up (NVRAM erase, `esp_zigbee_init`,
+    AF registration, `esp_zigbee_start`) ran from the frame callback on the 4 KB
+    TWDT-subscribed RX task (5 s panic). A slow flash op could reboot the chip
+    mid-commissioning, and long handlers stalled MT-frame parsing + SRSP
+    timeliness. Bring-up now runs on a dedicated worker task (`ezb_main`), which
+    is NOT TWDT-subscribed (it blocks forever in `esp_zigbee_launch_mainloop`).
+    `ezb_start_stack` spawns the worker and returns immediately, so the 0x40
+    `ZDO_STARTUP_FROM_APP` SRSP is an immediate-accept; the host
+    (`zhac-components` `zigbee_mgr.cpp` `coordinator_start`) waits on the SRSP
+    only as an ack, then polls the async `ZDO_STATE_CHANGE_IND` state=9 emitted
+    later by the signal handler — so async bring-up is tolerated. The RX task
+    stack is raised 4096 → 8192 B and its `xTaskCreate` return is now checked
+    (an ignored failure left a silently RX-dead NCP). The T33 pre-init
+    `zb_storage` erase still runs unconditionally BEFORE `esp_zigbee_init` in the
+    new worker location.
+  - **HIGH — partial-init double-init** (`ezb_start_stack`): a failure after
+    `esp_zigbee_init` left the single `s_stack_inited` flag false, so a host
+    STARTUP_FROM_APP retry re-ran `esp_zigbee_init` on an initialised stack and
+    re-registered the signal handler (double-init UB + duplicate AREQ per
+    signal). Replaced with per-step latches (`s_zb_inited`, `s_handler_added`,
+    `s_af_registered`, `s_zb_started`) so a retry RESUMES from the failed step
+    instead of restarting bring-up.
+
 - **factory-reset / NV STARTUP_OPTION** (CRIT, FINDINGS §12, T33,
   `znp_dispatch.c:71` / `znp_ezb.c`): the NV `STARTUP_OPTION` (0x0003) write was
   swallowed. The host writes 0x03 (`CLEAR_STATE|CLEAR_CONFIG`) then `SYS_RESET`

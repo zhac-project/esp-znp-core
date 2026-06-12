@@ -41,7 +41,18 @@ void znp_uart_init(znp_frame_cb_t cb) {
     ESP_ERROR_CHECK(uart_set_pin(PORT, CONFIG_ZNP_UART_TX_GPIO, CONFIG_ZNP_UART_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     s_tx_mutex = xSemaphoreCreateMutex();
-    xTaskCreate(rx_task, "znp_uart_rx", 4096, NULL, 10, NULL);
+    /* P6-T35 (FINDINGS §12 HIGH, def 3): RX task stack raised 4096 → 8192 B.
+     * The RX task is TWDT-subscribed and was previously running the full
+     * dispatch chain incl. the ZBOSS stack bring-up on a thin 4 KB margin;
+     * bring-up is now off this task (see znp_ezb.c ezb_worker_task), but the
+     * dispatch + MT builders still need comfortable headroom, so keep ≥8 KB.
+     * Also: the create return is now CHECKED — an ignored failure here left a
+     * silently RX-dead NCP (host sees no SRSP, commissioning never starts). */
+    BaseType_t rc = xTaskCreate(rx_task, "znp_uart_rx", 8192, NULL, 10, NULL);
+    if (rc != pdPASS) {
+        ESP_LOGE(TAG, "xTaskCreate(znp_uart_rx) failed: %d — NCP RX is DEAD", (int)rc);
+        return;
+    }
     ESP_LOGI(TAG, "UART%d up @ %d 8N1 (tx=%d rx=%d)", PORT, CONFIG_ZNP_UART_BAUD,
              CONFIG_ZNP_UART_TX_GPIO, CONFIG_ZNP_UART_RX_GPIO);
 }
