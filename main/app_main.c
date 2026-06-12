@@ -17,7 +17,7 @@ static znp_dispatch_ctx s_ctx;
 static void on_frame(const mt_frame_t *f) {
     uint8_t buf[260];
     size_t n = znp_dispatch(f, &s_ctx, buf, sizeof(buf));
-    /* T36 / FINDINGS §12 LOW (def 5): a dropped SRSP leaves the host's
+    /* T36 / hardening LOW (def 5): a dropped SRSP leaves the host's
      * synchronous request waiting until its retry/timeout — surface the failure
      * instead of silently ignoring znp_uart_send_raw's result. */
     if (n > 0 && !znp_uart_send_raw(buf, n)) {
@@ -47,7 +47,7 @@ void app_main(void) {
     /* Announce we just booted — the host toggles NRESET and waits for this. */
     uint8_t buf[16];
     size_t n = znp_build_reset_ind(0x00, buf, sizeof(buf));
-    /* T36 / FINDINGS §12 LOW (def 5): the host waits for this RESET_IND after
+    /* T36 / hardening LOW (def 5): the host waits for this RESET_IND after
      * toggling NRESET. Check the builder length (0 = encode overflow) and the
      * send result instead of firing blind — a missed RESET_IND stalls the host's
      * NCP-up handshake with no operator-visible cause. */

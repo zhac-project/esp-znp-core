@@ -11,7 +11,7 @@ static size_t encode_srsp_sub(uint8_t subsys, uint8_t cmd1,
     return mt_encode(&f, buf, cap);
 }
 
-/* def 6 (FINDINGS §12 LOW): the SYS subsystem is by far the most common SRSP
+/* def 6 (LOW): the SYS subsystem is by far the most common SRSP
  * source, so keep the terse 4-arg spelling — but route it through the generic
  * encoder rather than a second hardwired copy. */
 static size_t encode_srsp(uint8_t cmd1, const uint8_t *pl, uint8_t pl_len,
@@ -25,7 +25,7 @@ static void put_le64(uint8_t *out, uint64_t v) {
     for (int i = 0; i < 8; i++) out[i] = (uint8_t)(v >> (i * 8));
 }
 
-/* def 2 (FINDINGS §12 HIGH): MT RPC-error SRSP for an unhandled SREQ.
+/* def 2 (HIGH): MT RPC-error SRSP for an unhandled SREQ.
  * A TI host blocks on every SREQ's SRSP with a timeout; an unrouted SREQ that
  * returns 0 = silence = 2-3 s × N retries of dead air (AF_DATA_REQUEST,
  * MGMT_LEAVE, MSG_CB_REGISTER, the ZDO interview reqs, …). Z-Stack answers the
@@ -77,7 +77,7 @@ static uint32_t le32(const uint8_t *p) {
 
 bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,
                           const uint8_t *val, uint8_t len) {
-    /* def 3 (FINDINGS §12 MED): a known id whose value is too short to be a
+    /* def 3 (MED): a known id whose value is too short to be a
      * valid setting is REJECTED (return false) rather than silently dropped.
      * The header promised accept/reject; before this fix the function could
      * never return false, so a truncated PRECFGKEY/PANID/etc. was dropped yet
@@ -118,7 +118,7 @@ bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,
 
 /* ── NV write handler (def 1 + def 3) ─────────────────────────────────────
  * Single entry for both osalNvWrite (0x09) and osalNvWriteExt (0x1D). Captures
- * the STARTUP_OPTION factory-reset request (def 1, FINDINGS §12 CRIT) and stages
+ * the STARTUP_OPTION factory-reset request (def 1, CRIT) and stages
  * tracked config via znp_netcfg_apply_nv (def 3 — returns false on reject).
  *
  * Returns true when the write is accepted (so the SRSP can answer success),
@@ -173,7 +173,7 @@ static size_t nv_delete_srsp(uint8_t *buf, size_t cap) {
 }
 
 /* NV_READ_EXT (0x1C) / NV_READ (0x08): SRSP = status(1) + len(1) + data[len].
- * def 4 (FINDINGS §12 LOW): TI returns NV_OPER_FAILED for a missing item, not
+ * def 4 (LOW): TI returns NV_OPER_FAILED for a missing item, not
  * SUCCESS+len0. We serve a readback from the staged cfg for the ids we track
  * (so a foreign host — e.g. z2m — can verify what it wrote) and answer
  * ZNP_NV_ITEM_UNINIT (0x02) for everything else instead of lying SUCCESS. */
@@ -246,7 +246,7 @@ static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
          * P4 sends: MT_SREQ(ZNP_ZDO)/0x40, payload={0x00,0x00} (startup delay LE16)
          * We: apply_config → start_stack, then reply the SRSP status.
          *
-         * def 4 (FINDINGS §12 MED): TI ZDO_STARTUP_FROM_APP status semantics are
+         * def 4 (MED): TI ZDO_STARTUP_FROM_APP status semantics are
          *   0x00 = RESTORED_NETWORK_STATE
          *   0x01 = NEW_NETWORK_STATE
          *   0x02 = NOT_STARTED  (the failure value)
@@ -258,7 +258,7 @@ static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
         case 0x40: {
             uint8_t status = 0x00;   /* success (restored) */
             if (be && be->apply_config) be->apply_config(ctx ? &ctx->cfg : NULL);
-            /* T36 / FINDINGS §12 MED (def 4): the network key (PRECFGKEY) was
+            /* T36 / hardening MED (def 4): the network key (PRECFGKEY) was
              * staged into ctx->cfg by an earlier osalNvWrite and has now been
              * consumed by apply_config (the backend copied it into its own
              * pending buffer + handed it to the stack). Zeroize this dispatch-ctx
@@ -299,7 +299,7 @@ static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
             return encode_srsp_sub(ZNP_ZDO, 0x50, pl, sizeof(pl), buf, cap);
         }
 
-        /* ZDO_MGMT_PERMIT_JOIN_REQ (0x36) — def 1 (FINDINGS §12 HIGH):
+        /* ZDO_MGMT_PERMIT_JOIN_REQ (0x36) — def 1 (HIGH):
          * pairing was DEAD because 0x36 fell into default:return 0, so the host
          * (zigbee_mgr zcl_commands.cpp:58 zigbee_permit_join) saw NO SRSP and
          * burned 3× the 2000 ms znp_sreq_retry timeout per open-network attempt.
@@ -431,14 +431,14 @@ static size_t dispatch_sys(const mt_frame_t *req, znp_dispatch_ctx *ctx,
                 uint16_t nv_id  = le16(pl);
                 /* offset at pl[2..3] — we ignore offset (always 0 from P4) */
                 uint16_t dlen16 = le16(pl + 4);
-                /* F44 (FINDINGS.md): 128 B clamp. Every NV item the P4 writes
+                /* hardening: 128 B clamp. Every NV item the P4 writes
                  * (network key 16 B, PAN id, channel, ...) is far below this, so
                  * the clamp never truncates a real write — it only bounds the
                  * copy into znp_netcfg_apply_nv. A >128 B osalNvWriteExt (which
                  * Z-Stack would accept) is silently truncated: an intentional,
                  * documented divergence for this NCP, not a Z-Stack-faithful path. */
                 uint8_t  dlen   = (dlen16 > 128) ? 128 : (uint8_t)dlen16;
-                /* def 2 (FINDINGS §12 HIGH): size_t arithmetic — never let
+                /* def 2 (HIGH): size_t arithmetic — never let
                  * (uint8_t)(6 + dlen) wrap for dlen near 0xFF and pass the guard
                  * while apply_nv over-reads the payload. (Here dlen is already
                  * clamped to ≤128 so the cast was accidentally safe; size_t makes
@@ -461,7 +461,7 @@ static size_t dispatch_sys(const mt_frame_t *req, znp_dispatch_ctx *ctx,
             if (ctx && plen >= 5) {
                 uint16_t nv_id = le16(pl);
                 uint8_t  dlen  = pl[4];
-                /* def 2 (FINDINGS §12 HIGH): dlen=pl[4] can be up to 0xFF. The old
+                /* def 2 (HIGH): dlen=pl[4] can be up to 0xFF. The old
                  * guard `plen >= (uint8_t)(5 + dlen)` wrapped to ≤4 for dlen in
                  * [251..255], passing the check and letting apply_nv over-read up
                  * to 255 B from a ≤245 B payload (stale parser-buffer bytes into
@@ -517,7 +517,7 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
                     uint8_t *buf, size_t cap) {
     const znp_backend_t *be = ctx ? ctx->be : NULL;
 
-    /* def 3 (FINDINGS §12 MED): AREQ-typed SYS_RESET_REQ routing.
+    /* def 3 (MED): AREQ-typed SYS_RESET_REQ routing.
      * The current host sends reset as SREQ (zigbee_mgr.cpp:307, MT_SREQ(ZNP_SYS)
      * /0x00) — handled below in dispatch_sys. But real Z-Stack hosts and
      * zigbee-herdsman send SYS_RESET_REQ as an AREQ (0x41/0x00), which the old
@@ -545,7 +545,7 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
 
     if (matched) return n;   /* a real handler ran (incl. silent SYS_RESET) */
 
-    /* def 2 (FINDINGS §12 HIGH): no handler. For a SREQ the host is blocking on
+    /* def 2 (HIGH): no handler. For a SREQ the host is blocking on
      * an SRSP — answer the MT RPC-error frame so it fails immediately instead of
      * burning N × the sreq timeout in dead air. Unrouted AREQs stay silent. */
     if (is_sreq(req->cmd0)) {

@@ -18,7 +18,7 @@ extern "C" {
 #define ZNP_VER_MINOR     0x07
 #define ZNP_VER_MAINT     0x01
 /* Advertised MT capability bitmap (SYS_PING SRSP, 16-bit LE).
- * def 5 (FINDINGS §12 LOW): the old 0x0179 advertised SAPI (MT_CAP_SAPI 0x0020)
+ * def 5 (LOW): the old 0x0179 advertised SAPI (MT_CAP_SAPI 0x0020)
  * and UTIL (MT_CAP_UTIL 0x0040) — but neither subsystem is routed in
  * znp_dispatch (a capability-probing host such as zigbee-herdsman, whose startup
  * issues UTIL_GET_DEVICE_INFO, would trust a dead subsystem and then time out).
@@ -50,7 +50,7 @@ extern "C" {
 #define ZNP_NV_OPER_FAILED   0x0A   /* NV_OPER_FAILED — write rejected  */
 #define ZNP_NV_ITEM_UNINIT   0x02   /* NV_ITEM_UNINIT — item not present */
 
-/* ── Factory-new flag (def 1 / FINDINGS §12 CRIT) ─────────────────────────
+/* ── Factory-new flag (def 1 / hardening CRIT) ─────────────────────────
  * When the host writes STARTUP_OPTION with a clear bit set, the dispatcher
  * raises this latch in the dispatch ctx. The chip backend persists it to NVS
  * (znp_ezb.c) so that on the NEXT boot, BEFORE esp_zigbee_init, the zb_storage
@@ -69,7 +69,7 @@ typedef struct {
  * (a known id whose value is too short to be valid — e.g. an 8-byte PRECFGKEY
  * when 16 are required). Unknown/untracked ids are accepted (return true) and
  * ignored. Guards against short val buffers — never over-reads.
- * Def 3 (FINDINGS §12 MED): the rejection path is real now; a false result must
+ * Def 3 (MED): the rejection path is real now; a false result must
  * be surfaced as an NV-failure status in the write SRSP (callers must not lie
  * 0x00-success when apply was rejected). */
 bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,

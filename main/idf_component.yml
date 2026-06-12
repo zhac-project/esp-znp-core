@@ -1,5 +1,5 @@
 dependencies:
-  # F52 (FINDINGS.md): cap the upper bound so a fresh resolve cannot pull an
+  # Dependency-pinning hardening: cap the upper bound so a fresh resolve cannot pull an
   # untested next-major. dependencies.lock still pins the exact build.
   idf:
     version: ">=6.0,<7.0"

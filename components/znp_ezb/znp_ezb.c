@@ -38,7 +38,7 @@ static const char *TAG = "znp_ezb";
 /* ── Network-up flag, set from signal handler task context ──────────────── */
 static volatile bool s_net_up = false;
 
-/* F32 (FINDINGS.md): ezb_get_nwk_info() runs on the UART RX task and previously
+/* hardening: ezb_get_nwk_info() runs on the UART RX task and previously
  * read ezb_nwk_get_panid()/short_address() — stack-internal state — without the
  * stack lock, racing the mainloop. Instead we snapshot the identity here, in the
  * signal-handler (mainloop) context, whenever the network comes up, and serve
@@ -55,7 +55,7 @@ static void cache_nwk_info(void)
     s_cached_short = (uint16_t)ezb_nwk_get_short_address();
 }
 
-/* T36 / FINDINGS §12 MED (def 3): invalidate the cached identity when the
+/* T36 / hardening MED (def 3): invalidate the cached identity when the
  * network goes down (self-leave / steering-fail / NWK failure). Reset to the
  * "no network" sentinels so a host ZDO_EXT_NWK_INFO poll after the network dies
  * reads a coherent down state, not a stale panid/short from the dead network.
@@ -66,7 +66,7 @@ static void invalidate_nwk_info(void)
     s_cached_short = 0xFFFEu;
 }
 
-/* T36 / FINDINGS §12 MED (def 2 + def 3): bring the network up/down as ONE
+/* T36 / hardening MED (def 2 + def 3): bring the network up/down as ONE
  * ordered operation. On up: cache the identity FIRST, then publish s_net_up —
  * so a concurrent EXT_NWK_INFO reader never observes dev_state=0x09 paired with
  * a stale panid 0xFFFF. On down: clear s_net_up FIRST, then invalidate the
@@ -98,7 +98,7 @@ static void ezb_get_ieee(uint8_t out[8])
     if (err == ESP_OK) {
         for (int i = 0; i < 8; i++) out[i] = mac[7 - i];
     } else {
-        /* T36 / FINDINGS §12 LOW (def 5): an all-zero IEEE is an invalid EUI64
+        /* T36 / hardening LOW (def 5): an all-zero IEEE is an invalid EUI64
          * the host may accept as the coordinator address — surface the read
          * failure instead of silently serving zeros. */
         ESP_LOGE(TAG, "esp_read_mac(IEEE802154) failed: %d — serving all-zero IEEE", err);
@@ -111,7 +111,7 @@ static void ezb_request_reset(void)
     esp_restart();   /* reboots → app_main emits SYS_RESET_IND on next boot */
 }
 
-/* ── Factory-reset latch (def 1 / FINDINGS §12 CRIT) ──────────────────────── *
+/* ── Factory-reset latch (def 1 / hardening CRIT) ──────────────────────── *
  * The host writes NV STARTUP_OPTION with a clear bit set (then SYS_RESET) to
  * demand a blank coordinator. esp_restart() preserves the zb_storage NVRAM, so
  * unless we intervene the old PAN/network-key resurrects against the new config
@@ -173,7 +173,7 @@ static bool consume_factory_new_flag(void)
 static znp_netcfg_t s_pending_cfg;
 static bool         s_have_pending_cfg = false;
 
-/* ── def 4 / FINDINGS §12 HIGH — per-step init latches ───────────────────── *
+/* ── def 4 / hardening HIGH — per-step init latches ───────────────────── *
  * The old single `s_stack_inited` flag was only set true at the very END of
  * bring-up. Any failure after esp_zigbee_init (handler add / AF reg / start /
  * task create) left it false, so a host STARTUP_FROM_APP retry re-ran
@@ -194,7 +194,7 @@ static void ezb_apply_config(const znp_netcfg_t *cfg)
 {
     if (!cfg) return;
 
-    /* T36 / FINDINGS §12 MED (def 3b): once the stack has started, the buffered
+    /* T36 / hardening MED (def 3b): once the stack has started, the buffered
      * config has ALREADY been consumed in bring_up_steps (step 3, gated on
      * s_af_registered) and start_stack is idempotent-true thereafter. Re-staging
      * here would silently swallow the new config — the host's NV writes get an
@@ -221,7 +221,7 @@ static void ezb_apply_config(const znp_netcfg_t *cfg)
 /* ── Signal handler — forward-declared for use in the bring-up worker ────── */
 static bool s_signal_handler(const ezb_app_signal_t *signal);
 
-/* T36 / FINDINGS §12 LOW (def 5): the STATE_CHANGE_IND AREQ is state-bearing —
+/* T36 / hardening LOW (def 5): the STATE_CHANGE_IND AREQ is state-bearing —
  * the host's commissioning gate polls for state=9 within a 10 s window (per
  * T35's finding). A single dropped frame (200 ms TX-mutex-timeout) silently
  * stalls that gate with no host retry. znp_uart_send_raw already logs the drop,
@@ -255,7 +255,7 @@ static void send_state_change_ind(uint8_t dev_state)
 }
 
 /* ── Stack bring-up — runs on the dedicated worker task, NOT the RX task ──── *
- * def 3 / FINDINGS §12 HIGH: the entire ZBOSS bring-up (NVRAM erase, init, AF
+ * def 3 / hardening HIGH: the entire ZBOSS bring-up (NVRAM erase, init, AF
  * registration, start) used to run on the 4 KB TWDT-subscribed UART RX task. A
  * slow flash op there could trip the 5 s TWDT panic mid-commissioning, and any
  * long handler stalled MT-frame parsing + SRSP timeliness. Bring-up now lives
@@ -268,7 +268,7 @@ static void send_state_change_ind(uint8_t dev_state)
  * Per-step latches (def 4) make each step resume-not-restart on a retry. */
 static bool bring_up_steps(void)
 {
-    /* 0. Factory-reset consume (T33 / FINDINGS §12 CRIT).
+    /* 0. Factory-reset consume (T33 / hardening CRIT).
      * !!! MUST run before esp_zigbee_init — DO NOT move below it. !!!
      * P6-T35 relocated this bring-up off the UART RX task onto this worker; the
      * erase STAYS unconditionally BEFORE esp_zigbee_init: the stack reads the
@@ -359,7 +359,7 @@ static bool bring_up_steps(void)
             }
             if (c->have_nwk_key) {
                 ezb_secur_set_network_key(c->nwk_key);
-                /* T36 / FINDINGS §12 MED (def 4): the network key is security-
+                /* T36 / hardening MED (def 4): the network key is security-
                  * sensitive — once the stack has consumed it, zeroize our staged
                  * copy so the cleartext key does not linger in RAM for the
                  * process lifetime (open-source release: don't leave keys in
@@ -440,7 +440,7 @@ static void ezb_worker_task(void *arg)
     }
     s_bring_up_ok = true;
     ESP_LOGI(TAG, "stack bring-up complete — entering mainloop");
-    /* T36 / FINDINGS §12 LOW (def 5): launch_mainloop returns esp_err_t and
+    /* T36 / hardening LOW (def 5): launch_mainloop returns esp_err_t and
      * normally never returns. If it DOES return, the stack has shut down and the
      * NCP is silently radio-dead (network goes down with the loop). Mark the
      * network down (def 3) and LOG the err before self-deleting, so the failure
@@ -486,7 +486,7 @@ static bool ezb_start_stack(void)
 
 static bool ezb_bdb_commission(uint8_t ezb_mode)
 {
-    /* def 1 / FINDINGS §12 CRIT: this runs on the UART RX task while the
+    /* def 1 / hardening CRIT: this runs on the UART RX task while the
      * esp-zigbee mainloop task is live — a cross-task esp_zb_* call. The lib
      * header (esp_zigbee.h:175) makes holding the Zigbee lock MANDATORY for any
      * SDK API invoked OUTSIDE a stack callback. Without it the BDB scheduler is
@@ -511,7 +511,7 @@ static bool ezb_bdb_commission(uint8_t ezb_mode)
 static bool ezb_get_nwk_info(uint16_t *panid, uint16_t *short_addr,
                               uint8_t *dev_state)
 {
-    /* F32: return the mainloop-cached snapshot — no cross-task stack read. */
+    /* hardening: return the mainloop-cached snapshot — no cross-task stack read. */
     if (panid)      *panid      = s_cached_panid;
     if (short_addr) *short_addr = s_cached_short;
     /* 0x09 = TI DEV_ZB_COORD once network is up; 0x00 = not started */
@@ -523,7 +523,7 @@ static bool ezb_get_nwk_info(uint16_t *panid, uint16_t *short_addr,
 
 static bool ezb_permit_join(uint8_t dur)
 {
-    /* def 2 / FINDINGS §12 HIGH: same cross-task class as bdb_commission. Now
+    /* def 2 / hardening HIGH: same cross-task class as bdb_commission. Now
      * LIVE (T34 wired 0x36 → permit_join → here), reached from the RX task while
      * the mainloop runs. Hold the Zigbee lock (esp_zigbee.h:175 mandate). */
     if (!esp_zigbee_lock_acquire(portMAX_DELAY)) {
@@ -569,7 +569,7 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
     /* ── BDB first-start / reboot: device booted into its network ──────────── */
     case EZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case EZB_BDB_SIGNAL_DEVICE_REBOOT: {
-        /* T36 / FINDINGS §12 HIGH (def 1): these signals are NOT unconditional
+        /* T36 / hardening HIGH (def 1): these signals are NOT unconditional
          * success — they carry ezb_bdb_signal_simple_params_t with a status
          * field exactly like FORMATION/STEERING. A factory-new init that fails,
          * or a REBOOT that can't restore the NVRAM network, still raises the
@@ -605,7 +605,7 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
             ESP_LOGI(TAG, "signal 0x%04x: formation/steering success, network up, state_change_ind sent",
                      sig_type);
         } else {
-            /* T36 / FINDINGS §12 MED (def 3): a steering/formation FAILURE must
+            /* T36 / hardening MED (def 3): a steering/formation FAILURE must
              * clear any prior net-up + invalidate the cached identity so the NCP
              * stops reporting DEV_ZB_COORD over a network that never formed. */
             set_net_down();
@@ -666,7 +666,7 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
     }
 
     /* ── ZDO self-leave: THIS coordinator left its network ───────────────── *
-     * T36 / FINDINGS §12 MED (def 3). Distinct from LEAVE_INDICATION (a child
+     * T36 / hardening MED (def 3). Distinct from LEAVE_INDICATION (a child
      * left): EZB_ZDO_SIGNAL_LEAVE means our own node left (e.g. a reset-type
      * leave). The network is gone — clear s_net_up + invalidate the cached
      * identity so the NCP stops reporting DEV_ZB_COORD with a stale panid. */
@@ -677,7 +677,7 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
     }
 
     /* ── NWK status: per-frame routing diagnostics — NOT a net-down trigger ── *
-     * T36 / FINDINGS §12 MED (def 3). EZB_NWK_SIGNAL_NETWORK_STATUS carries an
+     * T36 / hardening MED (def 3). EZB_NWK_SIGNAL_NETWORK_STATUS carries an
      * ezb_nwk_signal_network_status_params_t{status, network_addr, ...} where
      * `status` is a per-FRAME NWK command status (NO_ROUTE_AVAILABLE 0x00,
      * LINK_FAILURE 0x02, INDIRECT_TRANSACTION_EXPIRY 0x06, TARGET_DEVICE_

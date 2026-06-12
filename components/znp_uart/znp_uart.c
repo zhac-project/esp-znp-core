@@ -14,16 +14,16 @@ static const char *TAG = "znp_uart";
 static const uart_port_t PORT = CONFIG_ZNP_UART_PORT;
 static znp_frame_cb_t s_cb = NULL;
 static SemaphoreHandle_t s_tx_mutex = NULL;
-static QueueHandle_t s_uart_q = NULL;   /* F32: UART event queue (overrun detection) */
+static QueueHandle_t s_uart_q = NULL;   /* hardening: UART event queue (overrun detection) */
 
 #define ZNP_UART_RX_BUF 512
-/* F32 (FINDINGS.md): bounded TX so a stalled host (not draining our TX FIFO)
+/* hardening: bounded TX so a stalled host (not draining our TX FIFO)
  * can't pin the Zigbee mainloop forever on the mutex. */
 #define ZNP_UART_TX_TIMEOUT_MS 200
 
 static void rx_task(void *arg);
 
-/* P6-T37 (FINDINGS §12 def 3): SINGLETON CONTRACT.
+/* P6-T37 (def 3): SINGLETON CONTRACT.
  * This driver is intentionally a process-wide singleton with no deinit. The
  * co-processor firmware brings the UART up exactly once at boot (from app_main)
  * and keeps it for the lifetime of the device; nothing ever tears it down, so a
@@ -54,7 +54,7 @@ void znp_uart_init(znp_frame_cb_t cb) {
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    /* F32: install WITH an event queue (20 slots) so the RX task can observe
+    /* hardening: install WITH an event queue (20 slots) so the RX task can observe
      * UART_FIFO_OVF / UART_BUFFER_FULL and resync, instead of silently dropping
      * bytes at 115200 with no flow control. */
     ESP_ERROR_CHECK(uart_driver_install(PORT, ZNP_UART_RX_BUF, ZNP_UART_RX_BUF, 20, &s_uart_q, 0));
@@ -62,7 +62,7 @@ void znp_uart_init(znp_frame_cb_t cb) {
     ESP_ERROR_CHECK(uart_set_pin(PORT, CONFIG_ZNP_UART_TX_GPIO, CONFIG_ZNP_UART_RX_GPIO,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     s_tx_mutex = xSemaphoreCreateMutex();
-    /* P6-T35 (FINDINGS §12 HIGH, def 3): RX task stack raised 4096 → 8192 B.
+    /* P6-T35 (HIGH, def 3): RX task stack raised 4096 → 8192 B.
      * The RX task is TWDT-subscribed and was previously running the full
      * dispatch chain incl. the ZBOSS stack bring-up on a thin 4 KB margin;
      * bring-up is now off this task (see znp_ezb.c ezb_worker_task), but the
@@ -84,7 +84,7 @@ void znp_uart_init(znp_frame_cb_t cb) {
 
 bool znp_uart_send_raw(const uint8_t *buf, size_t len) {
     if (!buf || len == 0) return false;
-    /* F32: bounded mutex wait — drop + log rather than block the caller (the
+    /* hardening: bounded mutex wait — drop + log rather than block the caller (the
      * stack mainloop / signal handler) indefinitely under TX contention. */
     if (s_tx_mutex &&
         xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(ZNP_UART_TX_TIMEOUT_MS)) != pdTRUE) {
@@ -105,7 +105,7 @@ static void rx_task(void *arg) {
     mt_frame_t frame;
     uart_event_t ev;
 
-    /* F32: subscribe to the task watchdog so a wedged RX loop reboots the
+    /* hardening: subscribe to the task watchdog so a wedged RX loop reboots the
      * co-processor. Best effort — no-op if the TWDT isn't enabled in sdkconfig. */
     esp_task_wdt_add(NULL);
 
@@ -132,7 +132,7 @@ static void rx_task(void *arg) {
         }
         case UART_FIFO_OVF:
         case UART_BUFFER_FULL:
-            /* F32 + P6-T37 (FINDINGS §12 def 1): RX overrun — bytes were lost,
+            /* P6-T37 (def 1): RX overrun — bytes were lost,
              * so the in-flight MT frame is unrecoverable.
              *
              * ORDER MATTERS: xQueueReset() FIRST, then uart_flush_input().
@@ -153,7 +153,7 @@ static void rx_task(void *arg) {
             break;
         case UART_FRAME_ERR:
         case UART_PARITY_ERR:
-            /* P6-T37 (FINDINGS §12 def 2): a framing or parity error means the
+            /* P6-T37 (def 2): a framing or parity error means the
              * byte stream is corrupt at the wire level. Previously these fell
              * into default and were ignored, letting noise bytes stream into the
              * parser guarded only by the weak XOR-8 FCS (1/256 false-accept — a

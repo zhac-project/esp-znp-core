@@ -11,7 +11,7 @@ uint8_t mt_fcs(uint8_t len, uint8_t cmd0, uint8_t cmd1,
 
 size_t mt_encode(const mt_frame_t *f, uint8_t *buf, size_t buf_size) {
     if (f->payload_len > MT_MAX_PAYLOAD) return 0;
-    /* P6-T37 (FINDINGS §12 def 5): public-API NULL guard. A caller passing a
+    /* P6-T37 (def 5): public-API NULL guard. A caller passing a
      * NULL payload with a non-zero payload_len would otherwise deref NULL in the
      * copy loop below. Reject it via the same 0-return error convention. */
     if (f->payload == nullptr && f->payload_len > 0) return 0;
@@ -46,7 +46,7 @@ void mt_parser_reset(mt_parser_t *p) {
     p->state = 0; p->len = 0; p->idx = 0;
 }
 
-/* P6-T37 (FINDINGS §12 def 4): byte-preserving resync. When a frame is rejected
+/* P6-T37 (def 4): byte-preserving resync. When a frame is rejected
  * mid-stream (over-length LEN, or a failed FCS), the offending byte must not be
  * blindly discarded — it may itself be the NEXT frame's start-of-frame. Reset to
  * the SOF-hunt state, then re-test the current byte: if it is MT_SOF, advance to

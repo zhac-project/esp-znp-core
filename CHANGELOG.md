@@ -6,6 +6,32 @@ follow the platform-wide `vYYYYMMDDVV` scheme.
 
 ## [Unreleased]
 
+### Changed
+
+- **Open-source publish prep** (T38): mechanical privacy/publish scrubs ahead of
+  the first public push of this repo. No live credentials or keys were found
+  anywhere in the tree.
+  - Untracked `tools/__pycache__/test_znp.cpython-312.pyc` (it embedded an
+    absolute local build path); added `__pycache__/` and `*.py[co]` to
+    `.gitignore`. The `.pyc` body held no secret, so a history rewrite was *not*
+    required — it is simply untracked going forward.
+  - Relocated the internal AI dev-plan artifacts under `docs/superpowers/plans/`
+    out of this public repo (per the project's private-docs rule). The three
+    `2026-05-27-mt-ncp-*.md` plans are preserved in the workspace `extra/` tree,
+    not published. The public `docs/zigbee-herdsman-z2m-compat-roadmap.md` is
+    kept.
+  - Reworded dangling references to an internal `FINDINGS.md` review doc out of
+    source comments and config (`sdkconfig.defaults`, `main/idf_component.yml`,
+    `.github/workflows/ci.yml`, and the `znp_*` / `mt_proto` component comments):
+    the `FINDINGS.md` filename, `FINDINGS §12` section tags, and bare `F##`
+    shorthand are replaced with plain-English hardening descriptions. Behaviour
+    is unchanged (comments/docs only). Historical `FINDINGS §12` citations in this
+    changelog are left as-is as a development-history record.
+  - **Pending user decision (not actioned):** the git author identity and
+    `CONTRIBUTORS.md` carry a personal name + gmail. Whether to publish as-is or
+    rewrite to a project/noreply identity (irreversible after first push) is the
+    maintainer's call; git history and `CONTRIBUTORS.md` were left untouched.
+
 ### Security
 
 - **UART RX recovery / MT parser robustness** (MED/LOW, FINDINGS §12, T37,
