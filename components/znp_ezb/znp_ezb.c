@@ -14,6 +14,8 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -70,6 +72,56 @@ static void ezb_request_reset(void)
     esp_restart();   /* reboots → app_main emits SYS_RESET_IND on next boot */
 }
 
+/* ── Factory-reset latch (def 1 / FINDINGS §12 CRIT) ──────────────────────── *
+ * The host writes NV STARTUP_OPTION with a clear bit set (then SYS_RESET) to
+ * demand a blank coordinator. esp_restart() preserves the zb_storage NVRAM, so
+ * unless we intervene the old PAN/network-key resurrects against the new config
+ * and the radio can never be factory-reset. We persist a one-shot flag in the
+ * default `nvs` partition here (on the UART RX task, during NV-write dispatch),
+ * then consume it on the NEXT boot inside ezb_start_stack — BEFORE
+ * esp_zigbee_init — by erasing the zb_storage partition. */
+#define ZNP_FN_NVS_NAMESPACE  "znp"
+#define ZNP_FN_NVS_KEY        "factory_new"   /* u8: 1 = erase zb_storage at next bring-up */
+#define ZNP_ZB_NVRAM_PARTITION "zb_storage"   /* matches partitions.csv + app_main init */
+
+static void ezb_request_factory_new(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(ZNP_FN_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "factory-new latch: nvs_open failed: %d", err);
+        return;
+    }
+    err = nvs_set_u8(h, ZNP_FN_NVS_KEY, 1);
+    if (err == ESP_OK) err = nvs_commit(h);   /* must survive the imminent reset */
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "factory-new latch: persist failed: %d", err);
+    } else {
+        ESP_LOGW(TAG, "factory-new latch set — zb_storage will be erased on next boot");
+    }
+}
+
+/* Returns true if the factory-new flag is set, and clears it (one-shot). */
+static bool consume_factory_new_flag(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(ZNP_FN_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    uint8_t flag = 0;
+    esp_err_t err = nvs_get_u8(h, ZNP_FN_NVS_KEY, &flag);
+    bool requested = (err == ESP_OK && flag != 0);
+    if (requested) {
+        /* Clear the latch BEFORE erasing so a crash mid-erase can't loop the
+         * device into a permanent wipe; the host re-requests if needed. */
+        nvs_erase_key(h, ZNP_FN_NVS_KEY);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+    return requested;
+}
+
 /* ── 1. apply_config ─────────────────────────────────────────────────────── *
  * BUG FIX (post Phase-4 HW test): the ezb_set_ and ezb_secur_set_ calls
  * touch stack-internal state that does not exist until esp_zigbee_init()
@@ -107,6 +159,26 @@ static void mainloop_task(void *arg)
 static bool ezb_start_stack(void)
 {
     if (s_stack_inited) return true;   /* idempotent — host may resend STARTUP_FROM_APP */
+
+    /* 0. Factory-reset consume (def 1 / FINDINGS §12 CRIT).
+     * !!! MUST run before esp_zigbee_init — DO NOT move below it. !!!
+     * P6-T35 will relocate this whole bring-up off the UART RX task onto a
+     * mainloop/worker. When it does, KEEP this erase running unconditionally
+     * BEFORE esp_zigbee_init: the stack reads the zb_storage NVRAM during init,
+     * so wiping it afterward would not give the host the blank radio it asked
+     * for via STARTUP_OPTION. esp_restart() preserves zb_storage; this is the
+     * only point at which the prior network/PAN/key can actually be cleared. */
+    if (consume_factory_new_flag()) {
+        esp_err_t eerr = nvs_flash_erase_partition(ZNP_ZB_NVRAM_PARTITION);
+        ESP_LOGW(TAG, "factory-new: erased %s partition (err=%d) before stack init",
+                 ZNP_ZB_NVRAM_PARTITION, eerr);
+        /* Re-init the partition so esp_zigbee_init sees a clean, mounted NVS. */
+        esp_err_t ierr = nvs_flash_init_partition(ZNP_ZB_NVRAM_PARTITION);
+        if (ierr != ESP_OK) {
+            ESP_LOGE(TAG, "factory-new: re-init %s failed: %d",
+                     ZNP_ZB_NVRAM_PARTITION, ierr);
+        }
+    }
 
     /* 1. Stack init (must run BEFORE any ezb_set_*) */
     esp_zigbee_config_t cfg = {
@@ -342,13 +414,14 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
 const znp_backend_t *znp_ezb_backend(void)
 {
     static const znp_backend_t b = {
-        .get_ieee       = ezb_get_ieee,
-        .request_reset  = ezb_request_reset,
-        .apply_config   = ezb_apply_config,
-        .start_stack    = ezb_start_stack,
-        .bdb_commission = ezb_bdb_commission,
-        .get_nwk_info   = ezb_get_nwk_info,
-        .permit_join    = ezb_permit_join,
+        .get_ieee             = ezb_get_ieee,
+        .request_reset        = ezb_request_reset,
+        .apply_config         = ezb_apply_config,
+        .start_stack          = ezb_start_stack,
+        .bdb_commission       = ezb_bdb_commission,
+        .get_nwk_info         = ezb_get_nwk_info,
+        .permit_join          = ezb_permit_join,
+        .request_factory_new  = ezb_request_factory_new,
     };
     return &b;
 }

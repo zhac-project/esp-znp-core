@@ -164,12 +164,17 @@ static void test_netcfg(void) {
     CHECK(znp_netcfg_apply_nv(&cfg, 0x1234, unk_val, 4) == true);
     CHECK(cfg.pan_id == old_pan);   /* unchanged */
 
-    /* Short val guard: PANID with len<2 must not crash or set flag */
+    /* Short val guard (def 3): a too-short known id must now be REJECTED
+     * (return false) and must not set its flag — no more silent lie-success. */
     znp_netcfg_t cfg2;
     memset(&cfg2, 0, sizeof(cfg2));
     const uint8_t short_val[1] = {0xFF};
-    CHECK(znp_netcfg_apply_nv(&cfg2, ZNP_NV_PANID, short_val, 1) == true);
+    CHECK(znp_netcfg_apply_nv(&cfg2, ZNP_NV_PANID, short_val, 1) == false);
     CHECK(cfg2.have_pan_id == false);
+    /* Short PRECFGKEY (8 of 16 bytes) likewise rejected. */
+    const uint8_t short_key[8] = {1,2,3,4,5,6,7,8};
+    CHECK(znp_netcfg_apply_nv(&cfg2, ZNP_NV_PRECFGKEY, short_key, 8) == false);
+    CHECK(cfg2.have_nwk_key == false);
 }
 
 /* ── new test: NV_WRITE_EXT dispatch round-trip ─────────────────────────── */
@@ -595,6 +600,137 @@ static void test_leave_ind_rejoin(void) {
     CHECK(buf[16] == 0x6F);
 }
 
+/* ── P6-T33 def tests: NV semantics + factory reset ──────────────────────── */
+
+/* def 1: STARTUP_OPTION with a clear bit set must latch a factory-new request
+ * via the backend hook; STARTUP_OPTION=0x00 must NOT. */
+static int s_factory_new_calls = 0;
+static void fake_factory_new(void) { s_factory_new_calls++; }
+
+static const znp_backend_t FAKE_FN = {
+    .get_ieee            = fake_get_ieee,
+    .request_reset       = fake_reset,
+    .apply_config        = fake_apply_config,
+    .start_stack         = fake_start_stack,
+    .bdb_commission      = fake_bdb_commission,
+    .get_nwk_info        = NULL,
+    .permit_join         = NULL,
+    .request_factory_new = fake_factory_new,
+};
+
+/* Build a SYS_OSAL_NV_WRITE_EXT (0x1D) frame: id(2 LE)+offset(2 LE)+len(2 LE)+data. */
+static size_t nv_write_ext(znp_dispatch_ctx *ctx, uint16_t id,
+                           const uint8_t *data, uint16_t dlen,
+                           uint8_t *buf, size_t cap) {
+    uint8_t pl[6 + 64];
+    pl[0] = (uint8_t)(id & 0xFF);   pl[1] = (uint8_t)(id >> 8);
+    pl[2] = 0; pl[3] = 0;
+    pl[4] = (uint8_t)(dlen & 0xFF); pl[5] = (uint8_t)(dlen >> 8);
+    if (dlen && data) memcpy(pl + 6, data, dlen);
+    mt_frame_t r = { MT_SREQ(ZNP_SYS), 0x1D, (uint8_t)(6 + dlen), pl };
+    return znp_dispatch(&r, ctx, buf, cap);
+}
+
+static void test_factory_new_latch(void) {
+    s_factory_new_calls = 0;
+    znp_dispatch_ctx ctx; memset(&ctx, 0, sizeof(ctx)); ctx.be = &FAKE_FN;
+    uint8_t buf[32];
+
+    /* STARTUP_OPTION = 0x03 (CLEAR_STATE|CLEAR_CONFIG) → latch once, SRSP ok */
+    const uint8_t opt03[1] = {0x03};
+    size_t n = nv_write_ext(&ctx, ZNP_NV_STARTUP_OPTION, opt03, 1, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_SUCCESS);
+    CHECK(s_factory_new_calls == 1);
+
+    /* STARTUP_OPTION = 0x00 → no latch, still SRSP ok */
+    const uint8_t opt00[1] = {0x00};
+    n = nv_write_ext(&ctx, ZNP_NV_STARTUP_OPTION, opt00, 1, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_SUCCESS);
+    CHECK(s_factory_new_calls == 1);   /* unchanged */
+
+    /* STARTUP_OPTION = 0x02 (CLEAR_STATE only) → latch again */
+    const uint8_t opt02[1] = {0x02};
+    nv_write_ext(&ctx, ZNP_NV_STARTUP_OPTION, opt02, 1, buf, sizeof(buf));
+    CHECK(s_factory_new_calls == 2);
+}
+
+/* def 2: length-guard uint8 wrap. NV_WRITE (0x09) dlen=pl[4]=0xFF with a short
+ * payload must NOT pass the guard / over-read; SRSP must be a failure status. */
+static void test_nv_write_len_guard_wrap(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[32];
+
+    /* osalNvWrite (0x09): id(2)+offset(2)+len(1)+data. Claim len=0xFF but supply
+     * only a tiny payload. Old code: (uint8_t)(5+255)=4, plen(7)>=4 passes →
+     * apply_nv reads 255 B. New size_t guard: plen(7) >= 5+255=260 is false. */
+    uint8_t pl[7] = { 0x83,0x00, 0x00,0x00, 0xFF, 0x34,0x12 };
+    mt_frame_t r = { MT_SREQ(ZNP_SYS), 0x09, sizeof(pl), pl };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[3] == 0x09);
+    CHECK(buf[4] == ZNP_NV_OPER_FAILED);     /* def 3: honest failure */
+    CHECK(ctx.cfg.have_pan_id == false);     /* def 2: nothing copied */
+
+    /* Same class on 0x1D: dlen16=0xFF but truncated payload → fail, no copy. */
+    znp_dispatch_ctx ctx2 = make_ctx();
+    uint8_t pl2[8] = { 0x83,0x00, 0x00,0x00, 0xFF,0x00, 0x34,0x12 };
+    mt_frame_t r2 = { MT_SREQ(ZNP_SYS), 0x1D, sizeof(pl2), pl2 };
+    n = znp_dispatch(&r2, &ctx2, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_OPER_FAILED);
+    CHECK(ctx2.cfg.have_pan_id == false);
+}
+
+/* def 3: a truncated/short value for a known id returns NV_OPER_FAILED, not
+ * a lie-success — and the well-formed write still succeeds. */
+static void test_nv_write_honest_status(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[32];
+
+    /* PRECFGKEY with only 8 bytes (16 required) → failure, key not staged. */
+    const uint8_t key8[8] = {1,2,3,4,5,6,7,8};
+    size_t n = nv_write_ext(&ctx, ZNP_NV_PRECFGKEY, key8, 8, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_OPER_FAILED);
+    CHECK(ctx.cfg.have_nwk_key == false);
+
+    /* Full 16-byte key → success. */
+    const uint8_t key16[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+    n = nv_write_ext(&ctx, ZNP_NV_PRECFGKEY, key16, 16, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_SUCCESS);
+    CHECK(ctx.cfg.have_nwk_key == true);
+}
+
+/* def 4: NV_READ of an unknown id returns NV_ITEM_UNINIT (0x02), and a known
+ * staged id reads back its value with SUCCESS. */
+static void test_nv_read_status(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[64];
+
+    /* Unknown id 0x0F00 → NV_ITEM_UNINIT, len 0. NV_READ_EXT (0x1C): id+offset. */
+    uint8_t rd_unknown[4] = { 0x00, 0x0F, 0x00, 0x00 };
+    mt_frame_t r = { MT_SREQ(ZNP_SYS), 0x1C, sizeof(rd_unknown), rd_unknown };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    CHECK(n == 7);                       /* FE+len+cmd0+cmd1+status+len0+fcs */
+    CHECK(buf[3] == 0x1C);
+    CHECK(buf[4] == ZNP_NV_ITEM_UNINIT); /* 0x02, not lie-success */
+    CHECK(buf[5] == 0x00);               /* len = 0 */
+
+    /* Stage a PANID then read it back: SUCCESS + 2-byte value. */
+    const uint8_t pan[2] = {0x34, 0x12};
+    nv_write_ext(&ctx, ZNP_NV_PANID, pan, 2, buf, sizeof(buf));
+    uint8_t rd_pan[4] = { 0x83, 0x00, 0x00, 0x00 };
+    mt_frame_t r2 = { MT_SREQ(ZNP_SYS), 0x1C, sizeof(rd_pan), rd_pan };
+    n = znp_dispatch(&r2, &ctx, buf, sizeof(buf));
+    CHECK(buf[4] == ZNP_NV_SUCCESS);
+    CHECK(buf[5] == 0x02);               /* len = 2 */
+    CHECK(buf[6] == 0x34);
+    CHECK(buf[7] == 0x12);
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main() {
@@ -625,6 +761,11 @@ int main() {
     test_tc_dev_ind_overflow();
     test_leave_ind();
     test_leave_ind_rejoin();
+    /* new (P6-T33: NV semantics + factory reset) */
+    test_factory_new_latch();
+    test_nv_write_len_guard_wrap();
+    test_nv_write_honest_status();
+    test_nv_read_status();
 
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all znp_dispatch tests passed\n");

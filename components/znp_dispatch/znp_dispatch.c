@@ -42,29 +42,35 @@ static uint32_t le32(const uint8_t *p) {
 
 bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,
                           const uint8_t *val, uint8_t len) {
+    /* def 3 (FINDINGS §12 MED): a known id whose value is too short to be a
+     * valid setting is REJECTED (return false) rather than silently dropped.
+     * The header promised accept/reject; before this fix the function could
+     * never return false, so a truncated PRECFGKEY/PANID/etc. was dropped yet
+     * the write SRSP still answered 0x00-success and the host formed a wrong
+     * network. The caller must surface false as an NV-failure status. */
     switch (id) {
         case ZNP_NV_PANID:
-            if (len < 2) return true;   /* guard short val */
+            if (len < 2) return false;   /* reject short val */
             cfg->pan_id = le16(val);
             cfg->have_pan_id = true;
             break;
         case ZNP_NV_EXTENDED_PANID:
-            if (len < 8) return true;
+            if (len < 8) return false;
             memcpy(cfg->ext_pan_id, val, 8);
             cfg->have_ext_pan_id = true;
             break;
         case ZNP_NV_CHANLIST:
-            if (len < 4) return true;
+            if (len < 4) return false;
             cfg->chan_mask = le32(val);
             cfg->have_chan_mask = true;
             break;
         case ZNP_NV_PRECFGKEY:
-            if (len < 16) return true;
+            if (len < 16) return false;
             memcpy(cfg->nwk_key, val, 16);
             cfg->have_nwk_key = true;
             break;
         case ZNP_NV_LOGICAL_TYPE:
-            if (len < 1) return true;
+            if (len < 1) return false;
             cfg->logical_type = val[0];
             cfg->have_logical_type = true;
             break;
@@ -75,11 +81,41 @@ bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,
     return true;
 }
 
+/* ── NV write handler (def 1 + def 3) ─────────────────────────────────────
+ * Single entry for both osalNvWrite (0x09) and osalNvWriteExt (0x1D). Captures
+ * the STARTUP_OPTION factory-reset request (def 1, FINDINGS §12 CRIT) and stages
+ * tracked config via znp_netcfg_apply_nv (def 3 — returns false on reject).
+ *
+ * Returns true when the write is accepted (so the SRSP can answer success),
+ * false when it must be reported as an NV failure. */
+static bool handle_nv_write(znp_dispatch_ctx *ctx, uint16_t nv_id,
+                            const uint8_t *val, uint8_t len) {
+    if (nv_id == ZNP_NV_STARTUP_OPTION) {
+        /* CRIT: the host writes STARTUP_OPTION (then SYS_RESET) to demand a
+         * blank coordinator. esp_restart() preserves the zb_storage NVRAM, so
+         * the old PAN/network-key would resurrect against the new config and the
+         * radio could never be factory-reset. When a clear bit is set, latch a
+         * persistent factory-new request; znp_ezb.c erases zb_storage BEFORE
+         * esp_zigbee_init on the next boot. STARTUP_OPTION=0x00 is a no-op. */
+        if (len < 1) return false;             /* malformed → honest failure */
+        uint8_t opt = val[0];
+        if (opt & (ZNP_STARTOPT_CLEAR_STATE | ZNP_STARTOPT_CLEAR_CONFIG)) {
+            if (ctx->be && ctx->be->request_factory_new) {
+                ctx->be->request_factory_new();
+            }
+        }
+        return true;   /* STARTUP_OPTION itself is not staged into netcfg */
+    }
+    return znp_netcfg_apply_nv(&ctx->cfg, nv_id, val, len);
+}
+
 /* ── NV SRSP helpers ─────────────────────────────────────────────────────── */
 
-/* NV_WRITE_EXT (0x1D) / NV_WRITE (0x09): SRSP = status(1), 0x00=success */
-static size_t nv_write_srsp(uint8_t cmd1, uint8_t *buf, size_t cap) {
-    const uint8_t pl[1] = { 0x00 };
+/* NV_WRITE_EXT (0x1D) / NV_WRITE (0x09): SRSP = status(1).
+ * def 3: status is now honest — 0x00=success only when the write was actually
+ * applied; ZNP_NV_OPER_FAILED (0x0A) when validation/apply rejected it. */
+static size_t nv_write_srsp(uint8_t cmd1, uint8_t status, uint8_t *buf, size_t cap) {
+    const uint8_t pl[1] = { status };
     return encode_srsp(cmd1, pl, 1, buf, cap);
 }
 
@@ -101,13 +137,63 @@ static size_t nv_delete_srsp(uint8_t *buf, size_t cap) {
     return encode_srsp(0x12, pl, 1, buf, cap);
 }
 
-/* NV_READ_EXT (0x1C) / NV_READ (0x08): SRSP = status(1) + len(1) + data[len]
- * We return zeros for the data since we buffer writes but don't expose readback. */
+/* NV_READ_EXT (0x1C) / NV_READ (0x08): SRSP = status(1) + len(1) + data[len].
+ * def 4 (FINDINGS §12 LOW): TI returns NV_OPER_FAILED for a missing item, not
+ * SUCCESS+len0. We serve a readback from the staged cfg for the ids we track
+ * (so a foreign host — e.g. z2m — can verify what it wrote) and answer
+ * ZNP_NV_ITEM_UNINIT (0x02) for everything else instead of lying SUCCESS. */
 static size_t nv_read_srsp(uint8_t cmd1, const znp_netcfg_t *cfg,
                             uint16_t nv_id, uint8_t *buf, size_t cap) {
-    (void)cfg; (void)nv_id;   /* readback of arbitrary items not needed yet */
-    /* status=0x00, len=0, no data */
-    const uint8_t pl[2] = { 0x00, 0x00 };
+    uint8_t pl[2 + 16];   /* status + len + up to a 16-byte network key */
+    uint8_t dlen = 0;
+    bool    have = false;
+
+    if (cfg) {
+        switch (nv_id) {
+            case ZNP_NV_PANID:
+                if (cfg->have_pan_id) {
+                    pl[2] = (uint8_t)(cfg->pan_id & 0xFF);
+                    pl[3] = (uint8_t)(cfg->pan_id >> 8);
+                    dlen = 2; have = true;
+                }
+                break;
+            case ZNP_NV_EXTENDED_PANID:
+                if (cfg->have_ext_pan_id) {
+                    memcpy(pl + 2, cfg->ext_pan_id, 8); dlen = 8; have = true;
+                }
+                break;
+            case ZNP_NV_CHANLIST:
+                if (cfg->have_chan_mask) {
+                    pl[2] = (uint8_t)(cfg->chan_mask & 0xFF);
+                    pl[3] = (uint8_t)((cfg->chan_mask >> 8) & 0xFF);
+                    pl[4] = (uint8_t)((cfg->chan_mask >> 16) & 0xFF);
+                    pl[5] = (uint8_t)((cfg->chan_mask >> 24) & 0xFF);
+                    dlen = 4; have = true;
+                }
+                break;
+            case ZNP_NV_PRECFGKEY:
+                if (cfg->have_nwk_key) {
+                    memcpy(pl + 2, cfg->nwk_key, 16); dlen = 16; have = true;
+                }
+                break;
+            case ZNP_NV_LOGICAL_TYPE:
+                if (cfg->have_logical_type) {
+                    pl[2] = cfg->logical_type; dlen = 1; have = true;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (have) {
+        pl[0] = ZNP_NV_SUCCESS;
+        pl[1] = dlen;
+        return encode_srsp(cmd1, pl, (uint8_t)(2 + dlen), buf, cap);
+    }
+    /* Unknown / un-staged id: report uninitialised, not a false success. */
+    pl[0] = ZNP_NV_ITEM_UNINIT;
+    pl[1] = 0;
     return encode_srsp(cmd1, pl, 2, buf, cap);
 }
 
@@ -258,6 +344,10 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
         case 0x1D: {
             const uint8_t *pl = req->payload;
             uint8_t plen = req->payload_len;
+            /* def 3: assume failure until a write actually lands. A malformed or
+             * truncated frame must NOT answer 0x00-success (the host would then
+             * believe PAN/key/channel were stored and form a wrong network). */
+            uint8_t status = ZNP_NV_OPER_FAILED;
             if (ctx && plen >= 6) {
                 uint16_t nv_id  = le16(pl);
                 /* offset at pl[2..3] — we ignore offset (always 0 from P4) */
@@ -269,11 +359,17 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
                  * Z-Stack would accept) is silently truncated: an intentional,
                  * documented divergence for this NCP, not a Z-Stack-faithful path. */
                 uint8_t  dlen   = (dlen16 > 128) ? 128 : (uint8_t)dlen16;
-                if (plen >= (uint8_t)(6 + dlen)) {
-                    znp_netcfg_apply_nv(&ctx->cfg, nv_id, pl + 6, dlen);
+                /* def 2 (FINDINGS §12 HIGH): size_t arithmetic — never let
+                 * (uint8_t)(6 + dlen) wrap for dlen near 0xFF and pass the guard
+                 * while apply_nv over-reads the payload. (Here dlen is already
+                 * clamped to ≤128 so the cast was accidentally safe; size_t makes
+                 * it robust regardless of the clamp.) */
+                if ((size_t)plen >= 6u + (size_t)dlen) {
+                    status = handle_nv_write(ctx, nv_id, pl + 6, dlen)
+                             ? ZNP_NV_SUCCESS : ZNP_NV_OPER_FAILED;
                 }
             }
-            return nv_write_srsp(0x1D, buf, cap);
+            return nv_write_srsp(0x1D, status, buf, cap);
         }
 
         /* osalNvWrite (SYS 0x09):
@@ -282,14 +378,22 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
         case 0x09: {
             const uint8_t *pl = req->payload;
             uint8_t plen = req->payload_len;
+            uint8_t status = ZNP_NV_OPER_FAILED;   /* def 3: fail unless applied */
             if (ctx && plen >= 5) {
                 uint16_t nv_id = le16(pl);
                 uint8_t  dlen  = pl[4];
-                if (plen >= (uint8_t)(5 + dlen)) {
-                    znp_netcfg_apply_nv(&ctx->cfg, nv_id, pl + 5, dlen);
+                /* def 2 (FINDINGS §12 HIGH): dlen=pl[4] can be up to 0xFF. The old
+                 * guard `plen >= (uint8_t)(5 + dlen)` wrapped to ≤4 for dlen in
+                 * [251..255], passing the check and letting apply_nv over-read up
+                 * to 255 B from a ≤245 B payload (stale parser-buffer bytes into
+                 * nwk_key/PAN/cfg with a SUCCESS SRSP). size_t arithmetic cannot
+                 * wrap, so the guard now holds for every dlen. */
+                if ((size_t)plen >= 5u + (size_t)dlen) {
+                    status = handle_nv_write(ctx, nv_id, pl + 5, dlen)
+                             ? ZNP_NV_SUCCESS : ZNP_NV_OPER_FAILED;
                 }
             }
-            return nv_write_srsp(0x09, buf, cap);
+            return nv_write_srsp(0x09, status, buf, cap);
         }
 
         /* osalNvItemInit (SYS 0x07):

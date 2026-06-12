@@ -27,6 +27,26 @@ extern "C" {
 #define ZNP_NV_CHANLIST        0x0084
 #define ZNP_NV_PRECFGKEY       0x0062
 
+/* ── TI ZCD_STARTOPT_* bits for NV STARTUP_OPTION (id 0x0003) ─────────────
+ * The host writes 0x03 (CLEAR_CONFIG|CLEAR_STATE) before a SYS_RESET to demand
+ * a blank coordinator (see zigbee_mgr.cpp do_commissioning ~:299). On TI these
+ * bits make the boot loader wipe NV at startup. On this NCP esp_restart()
+ * preserves the zb_storage NVRAM, so we must reproduce that wipe ourselves —
+ * see ZNP_FACTORY_NEW_* below and znp_ezb.c. */
+#define ZNP_STARTOPT_CLEAR_CONFIG  0x01   /* TI ZCD_STARTOPT_CLEAR_CONFIG */
+#define ZNP_STARTOPT_CLEAR_STATE   0x02   /* TI ZCD_STARTOPT_CLEAR_STATE  */
+
+/* ── TI OSAL NV operation statuses (returned in NV SRSP status byte) ──────── */
+#define ZNP_NV_SUCCESS       0x00   /* ZSuccess                         */
+#define ZNP_NV_OPER_FAILED   0x0A   /* NV_OPER_FAILED — write rejected  */
+#define ZNP_NV_ITEM_UNINIT   0x02   /* NV_ITEM_UNINIT — item not present */
+
+/* ── Factory-new flag (def 1 / FINDINGS §12 CRIT) ─────────────────────────
+ * When the host writes STARTUP_OPTION with a clear bit set, the dispatcher
+ * raises this latch in the dispatch ctx. The chip backend persists it to NVS
+ * (znp_ezb.c) so that on the NEXT boot, BEFORE esp_zigbee_init, the zb_storage
+ * NVRAM partition is erased — giving the host the blank radio it asked for. */
+
 /* ── Network-config buffer (filled by buffered NV writes) ────────────────── */
 typedef struct {
     uint16_t pan_id;         bool have_pan_id;
@@ -36,8 +56,13 @@ typedef struct {
     uint8_t  logical_type;   bool have_logical_type;
 } znp_netcfg_t;
 
-/* Apply one NV write to cfg.  Returns true if accepted (unknown ids silently
- * accepted+ignored).  Guards against short val buffers — never over-reads. */
+/* Apply one NV write to cfg. Returns true if accepted, false if REJECTED
+ * (a known id whose value is too short to be valid — e.g. an 8-byte PRECFGKEY
+ * when 16 are required). Unknown/untracked ids are accepted (return true) and
+ * ignored. Guards against short val buffers — never over-reads.
+ * Def 3 (FINDINGS §12 MED): the rejection path is real now; a false result must
+ * be surfaced as an NV-failure status in the write SRSP (callers must not lie
+ * 0x00-success when apply was rejected). */
 bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,
                           const uint8_t *val, uint8_t len);
 
@@ -60,6 +85,11 @@ typedef struct {
     bool (*bdb_commission)(uint8_t ezb_mode_mask);   /* ezb_bdb_start_top_level_commissioning */
     bool (*get_nwk_info)(uint16_t *panid, uint16_t *short_addr, uint8_t *dev_state); /* (4.3) */
     bool (*permit_join)(uint8_t duration_s);
+    /* def 1: latch a persistent "factory-new" request. The dispatcher calls this
+     * when the host writes STARTUP_OPTION with a clear bit set. The backend MUST
+     * persist it across the imminent SYS_RESET (esp_restart) so the next boot
+     * erases the Zigbee NVRAM before esp_zigbee_init. May be NULL on host tests. */
+    void (*request_factory_new)(void);
 } znp_backend_t;
 
 /* ── Dispatch context (carries config buffer + backend pointer) ──────────── */
