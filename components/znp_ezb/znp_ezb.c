@@ -169,14 +169,34 @@ static bool ezb_start_stack(void)
      * for via STARTUP_OPTION. esp_restart() preserves zb_storage; this is the
      * only point at which the prior network/PAN/key can actually be cleared. */
     if (consume_factory_new_flag()) {
+        /* app_main already nvs_flash_init_partition("zb_storage")'d this
+         * partition, so erase + re-init here operates on an already-mounted,
+         * active partition — that is safe (erase deinits then re-formats it).
+         * (Closes the reasoning gap for the P6-T35 relocation.) */
         esp_err_t eerr = nvs_flash_erase_partition(ZNP_ZB_NVRAM_PARTITION);
-        ESP_LOGW(TAG, "factory-new: erased %s partition (err=%d) before stack init",
-                 ZNP_ZB_NVRAM_PARTITION, eerr);
-        /* Re-init the partition so esp_zigbee_init sees a clean, mounted NVS. */
+        if (eerr != ESP_OK) {
+            /* CRIT: a failed erase means the prior PAN/network-key survives. We
+             * MUST NOT proceed into esp_zigbee_init over the stale partition —
+             * that silently resurrects the old network the host asked us to
+             * wipe. The latch was already consumed (cleared) above, so re-set
+             * it and reboot: the next boot retries the wipe rather than coming
+             * up on stale state. */
+            ESP_LOGE(TAG, "factory-new: erase %s FAILED: %d — re-arming latch + restart",
+                     ZNP_ZB_NVRAM_PARTITION, eerr);
+            ezb_request_factory_new();
+            esp_restart();   /* no return */
+        }
+        ESP_LOGW(TAG, "factory-new: erased %s partition before stack init",
+                 ZNP_ZB_NVRAM_PARTITION);
+        /* Re-init the partition so esp_zigbee_init sees a clean, mounted NVS.
+         * If this fails the stack would run against an unmounted partition —
+         * equally unsafe, so re-arm + restart on the same fail-safe path. */
         esp_err_t ierr = nvs_flash_init_partition(ZNP_ZB_NVRAM_PARTITION);
         if (ierr != ESP_OK) {
-            ESP_LOGE(TAG, "factory-new: re-init %s failed: %d",
+            ESP_LOGE(TAG, "factory-new: re-init %s FAILED: %d — re-arming latch + restart",
                      ZNP_ZB_NVRAM_PARTITION, ierr);
+            ezb_request_factory_new();
+            esp_restart();   /* no return */
         }
     }
 

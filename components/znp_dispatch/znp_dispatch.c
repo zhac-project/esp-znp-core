@@ -204,7 +204,6 @@ static size_t nv_read_srsp(uint8_t cmd1, const znp_netcfg_t *cfg,
 static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
                            uint8_t *buf, size_t cap) {
     const znp_backend_t *be = ctx ? ctx->be : NULL;
-    const uint8_t status_ok[1] = { 0x00 };
 
     switch (req->cmd1) {
         /* ZDO_STARTUP_FROM_APP (0x40):
