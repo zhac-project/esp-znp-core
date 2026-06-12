@@ -4,18 +4,50 @@
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
-static size_t encode_srsp(uint8_t cmd1, const uint8_t *pl, uint8_t pl_len,
-                          uint8_t *buf, size_t cap) {
-    mt_frame_t f = { MT_SRSP(ZNP_SYS), cmd1, pl_len, pl };
-    return mt_encode(&f, buf, cap);
-}
-
 static size_t encode_srsp_sub(uint8_t subsys, uint8_t cmd1,
                                const uint8_t *pl, uint8_t pl_len,
                                uint8_t *buf, size_t cap) {
     mt_frame_t f = { MT_SRSP(subsys), cmd1, pl_len, pl };
     return mt_encode(&f, buf, cap);
 }
+
+/* def 6 (FINDINGS §12 LOW): the SYS subsystem is by far the most common SRSP
+ * source, so keep the terse 4-arg spelling — but route it through the generic
+ * encoder rather than a second hardwired copy. */
+static size_t encode_srsp(uint8_t cmd1, const uint8_t *pl, uint8_t pl_len,
+                          uint8_t *buf, size_t cap) {
+    return encode_srsp_sub(ZNP_SYS, cmd1, pl, pl_len, buf, cap);
+}
+
+/* def 6: serialize a 64-bit value little-endian (wire order) into out[0..7].
+ * Used for the IEEE EUI64 in tc_dev_ind + leave_ind (was duplicated inline). */
+static void put_le64(uint8_t *out, uint64_t v) {
+    for (int i = 0; i < 8; i++) out[i] = (uint8_t)(v >> (i * 8));
+}
+
+/* def 2 (FINDINGS §12 HIGH): MT RPC-error SRSP for an unhandled SREQ.
+ * A TI host blocks on every SREQ's SRSP with a timeout; an unrouted SREQ that
+ * returns 0 = silence = 2-3 s × N retries of dead air (AF_DATA_REQUEST,
+ * MGMT_LEAVE, MSG_CB_REGISTER, the ZDO interview reqs, …). Z-Stack answers the
+ * MONITOR-TEST RPC-error frame instead: SRSP of the RPC-subsystem 0 (cmd0=0x60,
+ * cmd1=0x00) with payload {errorcode, jcmd0, jcmd1} echoing the offending
+ * header. errorcode 0x02 = MT_RPC_ERR_COMMAND_ID (subsystem/cmd not supported).
+ * This turns triple-timeout dead-air into one immediate honest error until the
+ * command is actually implemented (out of scope here). DEFAULT fall-through
+ * ONLY — it must never shadow a real handler (incl. the new 0x36). */
+#define ZNP_RPC_ERR_INVALID_CMD  0x02   /* MT_RPC_ERR_COMMAND_ID */
+static size_t encode_rpc_error(const mt_frame_t *req, uint8_t errcode,
+                               uint8_t *buf, size_t cap) {
+    const uint8_t pl[3] = { errcode, req->cmd0, req->cmd1 };
+    /* cmd0 = MT_SRSP(0) = 0x60 (RPC subsystem 0 / MONITOR-boot res), cmd1 = 0x00 */
+    mt_frame_t f = { (uint8_t)0x60, 0x00, 3, pl };
+    return mt_encode(&f, buf, cap);
+}
+
+/* True when the frame is a synchronous request the host blocks on (SREQ type
+ * bits 0x20). Only SREQs warrant an RPC-error reply; an unrouted AREQ is
+ * fire-and-forget and must stay silent. */
+static bool is_sreq(uint8_t cmd0) { return (cmd0 & 0xE0) == 0x20; }
 
 /* Map a TI Z-Stack BDB mode byte to the ESP-Zigbee (EZB) mode mask.
  * TI FORMATION=0x04 → EZB 0x08, TI STEERING=0x02 → EZB 0x04.
@@ -202,18 +234,28 @@ static size_t nv_read_srsp(uint8_t cmd1, const znp_netcfg_t *cfg,
 /* ── ZDO subsystem dispatcher ────────────────────────────────────────────── */
 
 static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
-                           uint8_t *buf, size_t cap) {
+                           uint8_t *buf, size_t cap, bool *matched) {
     const znp_backend_t *be = ctx ? ctx->be : NULL;
+    *matched = true;   /* cleared in default: so the top level can RPC-error */
 
     switch (req->cmd1) {
         /* ZDO_STARTUP_FROM_APP (0x40):
          * P4 sends: MT_SREQ(ZNP_ZDO)/0x40, payload={0x00,0x00} (startup delay LE16)
-         * We: apply_config → start_stack, reply SRSP status 0x00 on success,
-         * 0x01 on failure. NULL backend op → treat as success. */
+         * We: apply_config → start_stack, then reply the SRSP status.
+         *
+         * def 4 (FINDINGS §12 MED): TI ZDO_STARTUP_FROM_APP status semantics are
+         *   0x00 = RESTORED_NETWORK_STATE
+         *   0x01 = NEW_NETWORK_STATE
+         *   0x02 = NOT_STARTED  (the failure value)
+         * The old code returned 0x01 on failure — but 0x01 is a SUCCESS variant
+         * to TI, so a generic host (zigbee-herdsman) read a failed start_stack as
+         * "new network started" and proceeded over a dead stack. Now: 0x02 on
+         * failure; 0x00 on success (we treat a started stack as restored — the
+         * host only branches success-vs-NOT_STARTED). NULL op → success (0x00). */
         case 0x40: {
-            uint8_t status = 0x00;
+            uint8_t status = 0x00;   /* success (restored) */
             if (be && be->apply_config) be->apply_config(ctx ? &ctx->cfg : NULL);
-            if (be && be->start_stack && !be->start_stack()) status = 0x01;
+            if (be && be->start_stack && !be->start_stack()) status = 0x02; /* NOT_STARTED */
             return encode_srsp_sub(ZNP_ZDO, 0x40, &status, 1, buf, cap);
         }
 
@@ -242,7 +284,31 @@ static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
             return encode_srsp_sub(ZNP_ZDO, 0x50, pl, sizeof(pl), buf, cap);
         }
 
+        /* ZDO_MGMT_PERMIT_JOIN_REQ (0x36) — def 1 (FINDINGS §12 HIGH):
+         * pairing was DEAD because 0x36 fell into default:return 0, so the host
+         * (zigbee_mgr zcl_commands.cpp:58 zigbee_permit_join) saw NO SRSP and
+         * burned 3× the 2000 ms znp_sreq_retry timeout per open-network attempt.
+         *
+         * Host wire layout (zcl_commands.cpp:62-71, exact bytes):
+         *   pl[0]   AddrMode      (0x0F broadcast)
+         *   pl[1:2] DstAddr LE    (0xFFFC = routers+coord)
+         *   pl[3]   Duration (s)  (0=close, 255=open indefinitely)  ← what we want
+         *   pl[4]   TCSignificance(0x01)
+         * The host only reads SRSP payload[0] as a status (0x00=success); the
+         * Z-Stack MGMT_PERMIT_JOIN_RSP AREQ (0x45/0xB6) is NOT registered by the
+         * host (no znp_register_areq for 0xB6), but a faithful TI NCP emits it,
+         * so we also queue it defensively — harmless if the host ignores it. */
+        case 0x36: {
+            uint8_t duration = (req->payload && req->payload_len >= 4)
+                               ? req->payload[3] : 0;
+            uint8_t status = 0x00;
+            if (be && be->permit_join && !be->permit_join(duration)) status = 0x01;
+            /* SRSP (the byte the host blocks on) — this alone unblocks pairing. */
+            return encode_srsp_sub(ZNP_ZDO, 0x36, &status, 1, buf, cap);
+        }
+
         default:
+            *matched = false;
             return 0;
     }
 }
@@ -250,9 +316,10 @@ static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
 /* ── APP_CNF subsystem dispatcher ────────────────────────────────────────── */
 
 static size_t dispatch_app_cnf(const mt_frame_t *req, znp_dispatch_ctx *ctx,
-                               uint8_t *buf, size_t cap) {
+                               uint8_t *buf, size_t cap, bool *matched) {
     const znp_backend_t *be = ctx ? ctx->be : NULL;
     const uint8_t status_ok[1] = { 0x00 };
+    *matched = true;
 
     switch (req->cmd1) {
         /* BDB_SET_CHANNEL (0x08):
@@ -274,6 +341,7 @@ static size_t dispatch_app_cnf(const mt_frame_t *req, znp_dispatch_ctx *ctx,
             return encode_srsp_sub(ZNP_APP_CNF, 0x05, &status, 1, buf, cap);
         }
         default:
+            *matched = false;
             return 0;
     }
 }
@@ -281,9 +349,10 @@ static size_t dispatch_app_cnf(const mt_frame_t *req, znp_dispatch_ctx *ctx,
 /* ── AF subsystem dispatcher ─────────────────────────────────────────────── */
 
 static size_t dispatch_af(const mt_frame_t *req, znp_dispatch_ctx *ctx,
-                          uint8_t *buf, size_t cap) {
+                          uint8_t *buf, size_t cap, bool *matched) {
     (void)ctx;
     const uint8_t status_ok[1] = { 0x00 };
+    *matched = true;
 
     switch (req->cmd1) {
         /* AF_REGISTER (0x00):
@@ -297,21 +366,17 @@ static size_t dispatch_af(const mt_frame_t *req, znp_dispatch_ctx *ctx,
             return encode_srsp_sub(ZNP_AF, 0x00, status_ok, 1, buf, cap);
 
         default:
+            *matched = false;
             return 0;
     }
 }
 
-/* ── znp_dispatch ────────────────────────────────────────────────────────── */
+/* ── SYS subsystem dispatcher ────────────────────────────────────────────── */
 
-size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
-                    uint8_t *buf, size_t cap) {
+static size_t dispatch_sys(const mt_frame_t *req, znp_dispatch_ctx *ctx,
+                           uint8_t *buf, size_t cap, bool *matched) {
     const znp_backend_t *be = ctx ? ctx->be : NULL;
-
-    /* Route by subsystem */
-    if (req->cmd0 == MT_SREQ(ZNP_ZDO))     return dispatch_zdo(req, ctx, buf, cap);
-    if (req->cmd0 == MT_SREQ(ZNP_AF))      return dispatch_af(req, ctx, buf, cap);
-    if (req->cmd0 == MT_SREQ(ZNP_APP_CNF)) return dispatch_app_cnf(req, ctx, buf, cap);
-    if (req->cmd0 != MT_SREQ(ZNP_SYS))     return 0;   /* unhandled subsystem */
+    *matched = true;
 
     switch (req->cmd1) {
 
@@ -426,8 +491,52 @@ size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
         }
 
         default:
+            *matched = false;
             return 0;  /* unhandled SYS command */
     }
+}
+
+/* ── znp_dispatch (top-level router) ─────────────────────────────────────── */
+
+size_t znp_dispatch(const mt_frame_t *req, znp_dispatch_ctx *ctx,
+                    uint8_t *buf, size_t cap) {
+    const znp_backend_t *be = ctx ? ctx->be : NULL;
+
+    /* def 3 (FINDINGS §12 MED): AREQ-typed SYS_RESET_REQ routing.
+     * The current host sends reset as SREQ (zigbee_mgr.cpp:307, MT_SREQ(ZNP_SYS)
+     * /0x00) — handled below in dispatch_sys. But real Z-Stack hosts and
+     * zigbee-herdsman send SYS_RESET_REQ as an AREQ (0x41/0x00), which the old
+     * SREQ-only routing dropped → the chip never reset. Route the AREQ form to
+     * the SAME request_reset path (T33). No SRSP either way: the host waits for
+     * the RESET_IND that follows on boot. */
+    if (req->cmd0 == MT_AREQ(ZNP_SYS) && req->cmd1 == 0x00) {
+        if (be && be->request_reset) be->request_reset();
+        return 0;
+    }
+
+    /* Route SREQs by subsystem. matched=false means the subsystem dispatcher had
+     * no handler for this cmd1 → fall through to the RPC-error (def 2). */
+    bool matched = false;
+    size_t n = 0;
+    if (req->cmd0 == MT_SREQ(ZNP_ZDO)) {
+        n = dispatch_zdo(req, ctx, buf, cap, &matched);
+    } else if (req->cmd0 == MT_SREQ(ZNP_AF)) {
+        n = dispatch_af(req, ctx, buf, cap, &matched);
+    } else if (req->cmd0 == MT_SREQ(ZNP_APP_CNF)) {
+        n = dispatch_app_cnf(req, ctx, buf, cap, &matched);
+    } else if (req->cmd0 == MT_SREQ(ZNP_SYS)) {
+        n = dispatch_sys(req, ctx, buf, cap, &matched);
+    }
+
+    if (matched) return n;   /* a real handler ran (incl. silent SYS_RESET) */
+
+    /* def 2 (FINDINGS §12 HIGH): no handler. For a SREQ the host is blocking on
+     * an SRSP — answer the MT RPC-error frame so it fails immediately instead of
+     * burning N × the sreq timeout in dead air. Unrouted AREQs stay silent. */
+    if (is_sreq(req->cmd0)) {
+        return encode_rpc_error(req, ZNP_RPC_ERR_INVALID_CMD, buf, cap);
+    }
+    return 0;
 }
 
 size_t znp_build_reset_ind(uint8_t reason, uint8_t *buf, size_t cap) {
@@ -459,15 +568,7 @@ size_t znp_build_tc_dev_ind(uint16_t nwk_addr, uint64_t ieee,
     uint8_t pl[11];
     pl[0] = (uint8_t)(nwk_addr & 0xFF);
     pl[1] = (uint8_t)(nwk_addr >> 8);
-    /* IEEE 8 bytes little-endian */
-    pl[2] = (uint8_t)(ieee);
-    pl[3] = (uint8_t)(ieee >> 8);
-    pl[4] = (uint8_t)(ieee >> 16);
-    pl[5] = (uint8_t)(ieee >> 24);
-    pl[6] = (uint8_t)(ieee >> 32);
-    pl[7] = (uint8_t)(ieee >> 40);
-    pl[8] = (uint8_t)(ieee >> 48);
-    pl[9] = (uint8_t)(ieee >> 56);
+    put_le64(pl + 2, ieee);   /* IEEE 8 bytes little-endian (def 6 helper) */
     pl[10] = capabilities;
     mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0xCA, 11, pl };
     return mt_encode(&f, buf, cap);
@@ -483,17 +584,27 @@ size_t znp_build_leave_ind(uint16_t src_addr, uint64_t ieee,
     uint8_t pl[12];
     pl[0] = (uint8_t)(src_addr & 0xFF);
     pl[1] = (uint8_t)(src_addr >> 8);
-    /* IEEE 8 bytes little-endian */
-    pl[2] = (uint8_t)(ieee);
-    pl[3] = (uint8_t)(ieee >> 8);
-    pl[4] = (uint8_t)(ieee >> 16);
-    pl[5] = (uint8_t)(ieee >> 24);
-    pl[6] = (uint8_t)(ieee >> 32);
-    pl[7] = (uint8_t)(ieee >> 40);
-    pl[8] = (uint8_t)(ieee >> 48);
-    pl[9] = (uint8_t)(ieee >> 56);
+    put_le64(pl + 2, ieee);   /* IEEE 8 bytes little-endian (def 6 helper) */
     pl[10] = remove;
     pl[11] = rejoin;
     mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0xC9, 12, pl };
+    return mt_encode(&f, buf, cap);
+}
+
+/* ZDO_MGMT_PERMIT_JOIN_RSP  AREQ 0x45/0xB6  (def 1 — companion to case 0x36)
+ * A faithful TI Z-Stack NCP follows the 0x36 SRSP with this unsolicited RSP.
+ * Payload: srcaddr(2 LE) + status(1) = 3 bytes. The current host does not
+ * register an 0xB6 handler, so this is emitted defensively for generic hosts
+ * (herdsman) that do; it never replaces the SRSP that actually unblocks
+ * zigbee_permit_join. The backend's permit_join path may call this then
+ * znp_uart_send_raw(), mirroring the other unsolicited AREQ builders. */
+size_t znp_build_permit_join_rsp(uint16_t src_addr, uint8_t status,
+                                 uint8_t *buf, size_t cap) {
+    const uint8_t pl[3] = {
+        (uint8_t)(src_addr & 0xFF),
+        (uint8_t)(src_addr >> 8),
+        status,
+    };
+    mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0xB6, 3, pl };
     return mt_encode(&f, buf, cap);
 }

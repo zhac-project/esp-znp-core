@@ -76,7 +76,9 @@ static void test_ping() {
     uint8_t buf[32]; mt_frame_t r = req(0x01);
     znp_dispatch_ctx ctx = make_ctx();
     size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
-    const uint8_t expect[7] = {0xFE,0x02,0x61,0x01,0x79,0x01,0x1A};
+    /* def 5 (T34): PING caps trimmed 0x0179→0x0119 (drop unrouted SAPI/UTIL).
+     * payload = {0x19,0x01} LE; FCS = 0x02^0x61^0x01^0x19^0x01 = 0x7A. */
+    const uint8_t expect[7] = {0xFE,0x02,0x61,0x01,0x19,0x01,0x7A};
     CHECK(n == 7);
     CHECK(memcmp(buf, expect, 7) == 0);
 }
@@ -100,13 +102,32 @@ static void test_extaddr() {
 }
 
 static void test_unknown() {
+    /* def 2 (T34): an unhandled SREQ no longer returns silence (0). It now
+     * answers the MT RPC-error frame: cmd0=0x60 (SRSP of RPC-subsystem 0),
+     * cmd1=0x00, payload {errcode=0x02, offending cmd0, offending cmd1}. */
     uint8_t buf[32];
     znp_dispatch_ctx ctx = make_ctx();
+
+    /* Unknown SYS cmd 0x99 (cmd0 = MT_SREQ(ZNP_SYS) = 0x21).
+     * FCS = 0x03^0x60^0x00^0x02^0x21^0x99 = 0xD9 */
     mt_frame_t r = req(0x99);
-    CHECK(znp_dispatch(&r, &ctx, buf, sizeof(buf)) == 0);
-    /* non-SYS subsystem is also unhandled this phase */
+    size_t n1 = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    const uint8_t exp_sys[8] = {0xFE,0x03,0x60,0x00,0x02,0x21,0x99,0xD9};
+    CHECK(n1 == 8);
+    CHECK(memcmp(buf, exp_sys, 8) == 0);
+
+    /* AF_DATA_REQUEST (0x01) is sent by the host ×13 but not yet implemented:
+     * must RPC-error, NOT silently drop (cmd0 = MT_SREQ(ZNP_AF) = 0x24).
+     * FCS = 0x03^0x60^0x00^0x02^0x24^0x01 = 0x44 */
     mt_frame_t af = { MT_SREQ(ZNP_AF), 0x01, 0, nullptr };
-    CHECK(znp_dispatch(&af, &ctx, buf, sizeof(buf)) == 0);
+    size_t n2 = znp_dispatch(&af, &ctx, buf, sizeof(buf));
+    const uint8_t exp_af[8] = {0xFE,0x03,0x60,0x00,0x02,0x24,0x01,0x44};
+    CHECK(n2 == 8);
+    CHECK(memcmp(buf, exp_af, 8) == 0);
+
+    /* An unrouted AREQ (not a SREQ) must stay SILENT — no RPC-error. */
+    mt_frame_t areq = { MT_AREQ(ZNP_AF), 0x99, 0, nullptr };
+    CHECK(znp_dispatch(&areq, &ctx, buf, sizeof(buf)) == 0);
 }
 
 static void test_reset_req() {
@@ -316,7 +337,10 @@ static const znp_backend_t FAIL_BE = {
 };
 
 static void test_startup_failure(void) {
-    /* start_stack returns false → STARTUP_FROM_APP SRSP status must be 0x01 */
+    /* def 4 (T34): start_stack returns false → STARTUP_FROM_APP SRSP status must
+     * be 0x02 (TI NOT_STARTED), NOT 0x01. 0x01 is TI NEW_NETWORK_STATE — a
+     * SUCCESS variant — so the old 0x01-on-failure masked a dead start_stack
+     * from generic hosts (herdsman). */
     znp_dispatch_ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.be = &FAIL_BE;
@@ -329,7 +353,7 @@ static void test_startup_failure(void) {
     CHECK(n == 6);
     CHECK(buf[2] == MT_SRSP(ZNP_ZDO));
     CHECK(buf[3] == 0x40);
-    CHECK(buf[4] == 0x01);   /* failure status */
+    CHECK(buf[4] == 0x02);   /* NOT_STARTED — honest failure (def 4) */
 }
 
 /* ── Task 4.3: ZDO_EXT_NWK_INFO (0x25/0x50) ──────────────────────────────── */
@@ -731,6 +755,109 @@ static void test_nv_read_status(void) {
     CHECK(buf[7] == 0x12);
 }
 
+/* ── P6-T34 def tests: dispatch completeness ─────────────────────────────── */
+
+/* def 1: MGMT_PERMIT_JOIN backend hook + SRSP. */
+static int     s_permit_calls    = 0;
+static uint8_t s_permit_duration = 0xFF;
+static bool fake_permit_join(uint8_t duration_s) {
+    s_permit_calls++;
+    s_permit_duration = duration_s;
+    return true;
+}
+static const znp_backend_t PERMIT_BE = {
+    .get_ieee       = nullptr,
+    .request_reset  = fake_reset,
+    .apply_config   = nullptr,
+    .start_stack    = nullptr,
+    .bdb_commission = nullptr,
+    .get_nwk_info   = nullptr,
+    .permit_join    = fake_permit_join,
+    .request_factory_new = nullptr,
+};
+
+/* def 1: ZDO_MGMT_PERMIT_JOIN_REQ (0x36) must call backend->permit_join with the
+ * duration at payload[3] and answer a 1-byte SRSP (the byte the host blocks on).
+ * Host wire layout (zcl_commands.cpp:62): AddrMode + DstAddr(2 LE) + Dur + TCsig. */
+static void test_permit_join(void) {
+    s_permit_calls = 0; s_permit_duration = 0xFF;
+    znp_dispatch_ctx ctx; memset(&ctx, 0, sizeof(ctx)); ctx.be = &PERMIT_BE;
+    uint8_t buf[32];
+
+    /* duration = 60s; AddrMode=0x0F, DstAddr=0xFFFC LE, TCsig=0x01 */
+    const uint8_t pl[5] = {0x0F, 0xFC, 0xFF, 60, 0x01};
+    mt_frame_t r = { MT_SREQ(ZNP_ZDO), 0x36, sizeof(pl), pl };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    /* SRSP: MT_SRSP(ZNP_ZDO)/0x36, status 0x00. FCS=0x01^0x65^0x36^0x00=0x52 */
+    const uint8_t expect[6] = {0xFE, 0x01, 0x65, 0x36, 0x00, 0x52};
+    CHECK(n == 6);
+    CHECK(memcmp(buf, expect, 6) == 0);
+    CHECK(s_permit_calls == 1);
+    CHECK(s_permit_duration == 60);   /* duration read from payload[3] */
+
+    /* def 1: companion MGMT_PERMIT_JOIN_RSP AREQ builder (0x45/0xB6).
+     * src=0x0000, status=0x00 → FE 03 45 B6 00 00 00 F0  (8 bytes: 5 overhead + 3)
+     * FCS = 0x03^0x45^0xB6^0x00^0x00^0x00 = 0xF0 */
+    size_t m = znp_build_permit_join_rsp(0x0000, 0x00, buf, sizeof(buf));
+    const uint8_t exp_rsp[8] = {0xFE, 0x03, 0x45, 0xB6, 0x00, 0x00, 0x00, 0xF0};
+    CHECK(m == 8);
+    CHECK(memcmp(buf, exp_rsp, 8) == 0);
+}
+
+/* def 2: an unhandled SREQ across every routed subsystem must RPC-error (not 0).
+ * Covers the host's real silent-drop victims: ZDO interview 0x02/0x04/0x05,
+ * MGMT_LEAVE 0x34, MSG_CB_REGISTER 0x3E, AF_DATA_REQUEST 0x01. */
+static void test_rpc_error_unhandled(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[32];
+    const struct { uint8_t cmd0, cmd1; } victims[] = {
+        { MT_SREQ(ZNP_ZDO), 0x02 },  /* NODE_DESC_REQ   */
+        { MT_SREQ(ZNP_ZDO), 0x04 },  /* SIMPLE_DESC_REQ */
+        { MT_SREQ(ZNP_ZDO), 0x05 },  /* ACTIVE_EP_REQ   */
+        { MT_SREQ(ZNP_ZDO), 0x34 },  /* MGMT_LEAVE_REQ  */
+        { MT_SREQ(ZNP_ZDO), 0x3E },  /* MSG_CB_REGISTER */
+        { MT_SREQ(ZNP_AF),  0x01 },  /* AF_DATA_REQUEST */
+    };
+    for (size_t i = 0; i < sizeof(victims)/sizeof(victims[0]); i++) {
+        mt_frame_t r = { victims[i].cmd0, victims[i].cmd1, 0, nullptr };
+        size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+        /* RPC-error frame: FE 03 60 00 02 <cmd0> <cmd1> FCS */
+        CHECK(n == 8);
+        CHECK(buf[0] == 0xFE);
+        CHECK(buf[1] == 0x03);
+        CHECK(buf[2] == 0x60);            /* MT_SRSP(0) — RPC subsystem 0 */
+        CHECK(buf[3] == 0x00);
+        CHECK(buf[4] == 0x02);            /* MT_RPC_ERR_COMMAND_ID */
+        CHECK(buf[5] == victims[i].cmd0); /* echoed offending cmd0 */
+        CHECK(buf[6] == victims[i].cmd1); /* echoed offending cmd1 */
+    }
+
+    /* CRITICAL: RPC-error must NOT shadow a real handler. The now-implemented
+     * 0x36 (permit-join) and the existing handlers must still produce their own
+     * SRSP, never the RPC-error frame. */
+    znp_dispatch_ctx pctx; memset(&pctx, 0, sizeof(pctx)); pctx.be = &PERMIT_BE;
+    const uint8_t pjpl[5] = {0x0F, 0xFC, 0xFF, 10, 0x01};
+    mt_frame_t pj = { MT_SREQ(ZNP_ZDO), 0x36, sizeof(pjpl), pjpl };
+    size_t np = znp_dispatch(&pj, &pctx, buf, sizeof(buf));
+    CHECK(np == 6);
+    CHECK(buf[2] == MT_SRSP(ZNP_ZDO));   /* real SRSP, not 0x60 RPC-error */
+    CHECK(buf[3] == 0x36);
+}
+
+/* def 3: SYS_RESET_REQ in AREQ form (0x41/0x00) must reach the SAME reset path
+ * as the SREQ form (T33). Generic/herdsman hosts send the AREQ form. No SRSP. */
+static void test_areq_reset(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[32];
+    int before = s_reset_calls;
+    /* AREQ SYS_RESET_REQ: cmd0 = MT_AREQ(ZNP_SYS) = 0x41, cmd1 = 0x00 */
+    mt_frame_t r = { MT_AREQ(ZNP_SYS), 0x00, 0, nullptr };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    CHECK(n == 0);                         /* no SRSP — host waits for RESET_IND */
+    CHECK(s_reset_calls == before + 1);    /* same request_reset path */
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main() {
@@ -766,6 +893,10 @@ int main() {
     test_nv_write_len_guard_wrap();
     test_nv_write_honest_status();
     test_nv_read_status();
+    /* new (P6-T34: dispatch completeness) */
+    test_permit_join();
+    test_rpc_error_unhandled();
+    test_areq_reset();
 
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all znp_dispatch tests passed\n");

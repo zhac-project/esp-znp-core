@@ -17,7 +17,16 @@ extern "C" {
 #define ZNP_VER_MAJOR     0x02
 #define ZNP_VER_MINOR     0x07
 #define ZNP_VER_MAINT     0x01
-#define ZNP_PING_CAPS     0x0179   /* advertised MT capability bitmap (16-bit LE) */
+/* Advertised MT capability bitmap (SYS_PING SRSP, 16-bit LE).
+ * def 5 (FINDINGS §12 LOW): the old 0x0179 advertised SAPI (MT_CAP_SAPI 0x0020)
+ * and UTIL (MT_CAP_UTIL 0x0040) — but neither subsystem is routed in
+ * znp_dispatch (a capability-probing host such as zigbee-herdsman, whose startup
+ * issues UTIL_GET_DEVICE_INFO, would trust a dead subsystem and then time out).
+ * Trimmed (not stubbed — trimming is the safe, honest choice for now) to ONLY
+ * the subsystems this NCP actually dispatches:
+ *   MT_CAP_SYS 0x0001 | MT_CAP_AF 0x0008 | MT_CAP_ZDO 0x0010 | MT_CAP_APP 0x0100
+ * (APP_CNF answers under the MT_CAP_APP bit.) = 0x0119. */
+#define ZNP_PING_CAPS     0x0119
 
 /* ── NV item IDs (mirrors z-stack-3.x / zigbee_mgr.cpp) ─────────────────── */
 #define ZNP_NV_STARTUP_OPTION  0x0003
@@ -132,6 +141,15 @@ size_t znp_build_tc_dev_ind(uint16_t nwk_addr, uint64_t ieee,
 size_t znp_build_leave_ind(uint16_t src_addr, uint64_t ieee,
                             uint8_t remove, uint8_t rejoin,
                             uint8_t *buf, size_t cap);
+
+/* ZDO_MGMT_PERMIT_JOIN_RSP  AREQ 0x45/0xB6 — companion to the 0x36 SRSP (def 1).
+ * Payload: srcaddr(2 LE) + status(1) = 3 bytes. The 0x36 case in znp_dispatch
+ * already returns the SRSP the host blocks on; this optional unsolicited RSP is
+ * what a faithful TI Z-Stack NCP additionally emits. The chip backend's
+ * permit_join path may build it here then znp_uart_send_raw() it (mirrors the
+ * other AREQ builders). Harmless if the host registers no 0xB6 handler. */
+size_t znp_build_permit_join_rsp(uint16_t src_addr, uint8_t status,
+                                 uint8_t *buf, size_t cap);
 
 #ifdef __cplusplus
 }
