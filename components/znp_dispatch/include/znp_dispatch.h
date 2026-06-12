@@ -17,7 +17,16 @@ extern "C" {
 #define ZNP_VER_MAJOR     0x02
 #define ZNP_VER_MINOR     0x07
 #define ZNP_VER_MAINT     0x01
-#define ZNP_PING_CAPS     0x0179   /* advertised MT capability bitmap (16-bit LE) */
+/* Advertised MT capability bitmap (SYS_PING SRSP, 16-bit LE).
+ * def 5 (LOW): the old 0x0179 advertised SAPI (MT_CAP_SAPI 0x0020)
+ * and UTIL (MT_CAP_UTIL 0x0040) — but neither subsystem is routed in
+ * znp_dispatch (a capability-probing host such as zigbee-herdsman, whose startup
+ * issues UTIL_GET_DEVICE_INFO, would trust a dead subsystem and then time out).
+ * Trimmed (not stubbed — trimming is the safe, honest choice for now) to ONLY
+ * the subsystems this NCP actually dispatches:
+ *   MT_CAP_SYS 0x0001 | MT_CAP_AF 0x0008 | MT_CAP_ZDO 0x0010 | MT_CAP_APP 0x0100
+ * (APP_CNF answers under the MT_CAP_APP bit.) = 0x0119. */
+#define ZNP_PING_CAPS     0x0119
 
 /* ── NV item IDs (mirrors z-stack-3.x / zigbee_mgr.cpp) ─────────────────── */
 #define ZNP_NV_STARTUP_OPTION  0x0003
@@ -26,6 +35,26 @@ extern "C" {
 #define ZNP_NV_EXTENDED_PANID  0x002D
 #define ZNP_NV_CHANLIST        0x0084
 #define ZNP_NV_PRECFGKEY       0x0062
+
+/* ── TI ZCD_STARTOPT_* bits for NV STARTUP_OPTION (id 0x0003) ─────────────
+ * The host writes 0x03 (CLEAR_CONFIG|CLEAR_STATE) before a SYS_RESET to demand
+ * a blank coordinator (see zigbee_mgr.cpp do_commissioning ~:299). On TI these
+ * bits make the boot loader wipe NV at startup. On this NCP esp_restart()
+ * preserves the zb_storage NVRAM, so we must reproduce that wipe ourselves —
+ * see ZNP_FACTORY_NEW_* below and znp_ezb.c. */
+#define ZNP_STARTOPT_CLEAR_CONFIG  0x01   /* TI ZCD_STARTOPT_CLEAR_CONFIG */
+#define ZNP_STARTOPT_CLEAR_STATE   0x02   /* TI ZCD_STARTOPT_CLEAR_STATE  */
+
+/* ── TI OSAL NV operation statuses (returned in NV SRSP status byte) ──────── */
+#define ZNP_NV_SUCCESS       0x00   /* ZSuccess                         */
+#define ZNP_NV_OPER_FAILED   0x0A   /* NV_OPER_FAILED — write rejected  */
+#define ZNP_NV_ITEM_UNINIT   0x02   /* NV_ITEM_UNINIT — item not present */
+
+/* ── Factory-new flag (def 1 / hardening CRIT) ─────────────────────────
+ * When the host writes STARTUP_OPTION with a clear bit set, the dispatcher
+ * raises this latch in the dispatch ctx. The chip backend persists it to NVS
+ * (znp_ezb.c) so that on the NEXT boot, BEFORE esp_zigbee_init, the zb_storage
+ * NVRAM partition is erased — giving the host the blank radio it asked for. */
 
 /* ── Network-config buffer (filled by buffered NV writes) ────────────────── */
 typedef struct {
@@ -36,8 +65,13 @@ typedef struct {
     uint8_t  logical_type;   bool have_logical_type;
 } znp_netcfg_t;
 
-/* Apply one NV write to cfg.  Returns true if accepted (unknown ids silently
- * accepted+ignored).  Guards against short val buffers — never over-reads. */
+/* Apply one NV write to cfg. Returns true if accepted, false if REJECTED
+ * (a known id whose value is too short to be valid — e.g. an 8-byte PRECFGKEY
+ * when 16 are required). Unknown/untracked ids are accepted (return true) and
+ * ignored. Guards against short val buffers — never over-reads.
+ * Def 3 (MED): the rejection path is real now; a false result must
+ * be surfaced as an NV-failure status in the write SRSP (callers must not lie
+ * 0x00-success when apply was rejected). */
 bool znp_netcfg_apply_nv(znp_netcfg_t *cfg, uint16_t id,
                           const uint8_t *val, uint8_t len);
 
@@ -60,6 +94,11 @@ typedef struct {
     bool (*bdb_commission)(uint8_t ezb_mode_mask);   /* ezb_bdb_start_top_level_commissioning */
     bool (*get_nwk_info)(uint16_t *panid, uint16_t *short_addr, uint8_t *dev_state); /* (4.3) */
     bool (*permit_join)(uint8_t duration_s);
+    /* def 1: latch a persistent "factory-new" request. The dispatcher calls this
+     * when the host writes STARTUP_OPTION with a clear bit set. The backend MUST
+     * persist it across the imminent SYS_RESET (esp_restart) so the next boot
+     * erases the Zigbee NVRAM before esp_zigbee_init. May be NULL on host tests. */
+    void (*request_factory_new)(void);
 } znp_backend_t;
 
 /* ── Dispatch context (carries config buffer + backend pointer) ──────────── */
@@ -102,6 +141,15 @@ size_t znp_build_tc_dev_ind(uint16_t nwk_addr, uint64_t ieee,
 size_t znp_build_leave_ind(uint16_t src_addr, uint64_t ieee,
                             uint8_t remove, uint8_t rejoin,
                             uint8_t *buf, size_t cap);
+
+/* ZDO_MGMT_PERMIT_JOIN_RSP  AREQ 0x45/0xB6 — companion to the 0x36 SRSP (def 1).
+ * Payload: srcaddr(2 LE) + status(1) = 3 bytes. The 0x36 case in znp_dispatch
+ * already returns the SRSP the host blocks on; this optional unsolicited RSP is
+ * what a faithful TI Z-Stack NCP additionally emits. The chip backend's
+ * permit_join path may build it here then znp_uart_send_raw() it (mirrors the
+ * other AREQ builders). Harmless if the host registers no 0xB6 handler. */
+size_t znp_build_permit_join_rsp(uint16_t src_addr, uint8_t status,
+                                 uint8_t *buf, size_t cap);
 
 #ifdef __cplusplus
 }

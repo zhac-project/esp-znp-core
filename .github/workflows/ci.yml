@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2025-2026 Evgenij Cjura and project contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# CI for the ESP32-C6 ZNP-clone co-processor firmware (FINDINGS.md F17).
+# CI for the ESP32-C6 ZNP-clone co-processor firmware.
 # Standalone repo (no sibling-component deps). NOTE: authored, not executed
 # in the dev sandbox — validate on first run.
 name: ci

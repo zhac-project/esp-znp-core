@@ -12,7 +12,7 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 #                      the binary image header(2048k).
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
-# F32 (FINDINGS.md): the radio co-processor is a single point of failure for the
+# RX-task / mainloop watchdog hardening: the radio co-processor is a single point of failure for the
 # whole product — give it self-recovery. Task WDT with panic-reboot catches a
 # wedged mainloop or stuck RX task (the rx_task subscribes via esp_task_wdt_add);
 # the brownout detector resets cleanly on a voltage sag instead of silently

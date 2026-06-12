@@ -17,7 +17,13 @@ static znp_dispatch_ctx s_ctx;
 static void on_frame(const mt_frame_t *f) {
     uint8_t buf[260];
     size_t n = znp_dispatch(f, &s_ctx, buf, sizeof(buf));
-    if (n > 0) znp_uart_send_raw(buf, n);
+    /* T36 / hardening LOW (def 5): a dropped SRSP leaves the host's
+     * synchronous request waiting until its retry/timeout — surface the failure
+     * instead of silently ignoring znp_uart_send_raw's result. */
+    if (n > 0 && !znp_uart_send_raw(buf, n)) {
+        ESP_LOGW(TAG, "on_frame: SRSP send failed (%u B) — host may time out / retry",
+                 (unsigned)n);
+    }
 }
 
 void app_main(void) {
@@ -41,7 +47,15 @@ void app_main(void) {
     /* Announce we just booted — the host toggles NRESET and waits for this. */
     uint8_t buf[16];
     size_t n = znp_build_reset_ind(0x00, buf, sizeof(buf));
-    znp_uart_send_raw(buf, n);
-
-    ESP_LOGI(TAG, "esp-znp-core MT-NCP up: SYS link ready, RESET_IND sent");
+    /* T36 / hardening LOW (def 5): the host waits for this RESET_IND after
+     * toggling NRESET. Check the builder length (0 = encode overflow) and the
+     * send result instead of firing blind — a missed RESET_IND stalls the host's
+     * NCP-up handshake with no operator-visible cause. */
+    if (n == 0) {
+        ESP_LOGE(TAG, "znp_build_reset_ind encode failed — RESET_IND NOT sent");
+    } else if (!znp_uart_send_raw(buf, n)) {
+        ESP_LOGE(TAG, "RESET_IND send failed — host NCP-up handshake may stall");
+    } else {
+        ESP_LOGI(TAG, "esp-znp-core MT-NCP up: SYS link ready, RESET_IND sent");
+    }
 }

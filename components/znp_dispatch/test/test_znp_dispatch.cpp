@@ -76,7 +76,9 @@ static void test_ping() {
     uint8_t buf[32]; mt_frame_t r = req(0x01);
     znp_dispatch_ctx ctx = make_ctx();
     size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
-    const uint8_t expect[7] = {0xFE,0x02,0x61,0x01,0x79,0x01,0x1A};
+    /* def 5 (T34): PING caps trimmed 0x0179→0x0119 (drop unrouted SAPI/UTIL).
+     * payload = {0x19,0x01} LE; FCS = 0x02^0x61^0x01^0x19^0x01 = 0x7A. */
+    const uint8_t expect[7] = {0xFE,0x02,0x61,0x01,0x19,0x01,0x7A};
     CHECK(n == 7);
     CHECK(memcmp(buf, expect, 7) == 0);
 }
@@ -100,13 +102,32 @@ static void test_extaddr() {
 }
 
 static void test_unknown() {
+    /* def 2 (T34): an unhandled SREQ no longer returns silence (0). It now
+     * answers the MT RPC-error frame: cmd0=0x60 (SRSP of RPC-subsystem 0),
+     * cmd1=0x00, payload {errcode=0x02, offending cmd0, offending cmd1}. */
     uint8_t buf[32];
     znp_dispatch_ctx ctx = make_ctx();
+
+    /* Unknown SYS cmd 0x99 (cmd0 = MT_SREQ(ZNP_SYS) = 0x21).
+     * FCS = 0x03^0x60^0x00^0x02^0x21^0x99 = 0xD9 */
     mt_frame_t r = req(0x99);
-    CHECK(znp_dispatch(&r, &ctx, buf, sizeof(buf)) == 0);
-    /* non-SYS subsystem is also unhandled this phase */
+    size_t n1 = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    const uint8_t exp_sys[8] = {0xFE,0x03,0x60,0x00,0x02,0x21,0x99,0xD9};
+    CHECK(n1 == 8);
+    CHECK(memcmp(buf, exp_sys, 8) == 0);
+
+    /* AF_DATA_REQUEST (0x01) is sent by the host ×13 but not yet implemented:
+     * must RPC-error, NOT silently drop (cmd0 = MT_SREQ(ZNP_AF) = 0x24).
+     * FCS = 0x03^0x60^0x00^0x02^0x24^0x01 = 0x44 */
     mt_frame_t af = { MT_SREQ(ZNP_AF), 0x01, 0, nullptr };
-    CHECK(znp_dispatch(&af, &ctx, buf, sizeof(buf)) == 0);
+    size_t n2 = znp_dispatch(&af, &ctx, buf, sizeof(buf));
+    const uint8_t exp_af[8] = {0xFE,0x03,0x60,0x00,0x02,0x24,0x01,0x44};
+    CHECK(n2 == 8);
+    CHECK(memcmp(buf, exp_af, 8) == 0);
+
+    /* An unrouted AREQ (not a SREQ) must stay SILENT — no RPC-error. */
+    mt_frame_t areq = { MT_AREQ(ZNP_AF), 0x99, 0, nullptr };
+    CHECK(znp_dispatch(&areq, &ctx, buf, sizeof(buf)) == 0);
 }
 
 static void test_reset_req() {
@@ -164,12 +185,17 @@ static void test_netcfg(void) {
     CHECK(znp_netcfg_apply_nv(&cfg, 0x1234, unk_val, 4) == true);
     CHECK(cfg.pan_id == old_pan);   /* unchanged */
 
-    /* Short val guard: PANID with len<2 must not crash or set flag */
+    /* Short val guard (def 3): a too-short known id must now be REJECTED
+     * (return false) and must not set its flag — no more silent lie-success. */
     znp_netcfg_t cfg2;
     memset(&cfg2, 0, sizeof(cfg2));
     const uint8_t short_val[1] = {0xFF};
-    CHECK(znp_netcfg_apply_nv(&cfg2, ZNP_NV_PANID, short_val, 1) == true);
+    CHECK(znp_netcfg_apply_nv(&cfg2, ZNP_NV_PANID, short_val, 1) == false);
     CHECK(cfg2.have_pan_id == false);
+    /* Short PRECFGKEY (8 of 16 bytes) likewise rejected. */
+    const uint8_t short_key[8] = {1,2,3,4,5,6,7,8};
+    CHECK(znp_netcfg_apply_nv(&cfg2, ZNP_NV_PRECFGKEY, short_key, 8) == false);
+    CHECK(cfg2.have_nwk_key == false);
 }
 
 /* ── new test: NV_WRITE_EXT dispatch round-trip ─────────────────────────── */
@@ -311,7 +337,10 @@ static const znp_backend_t FAIL_BE = {
 };
 
 static void test_startup_failure(void) {
-    /* start_stack returns false → STARTUP_FROM_APP SRSP status must be 0x01 */
+    /* def 4 (T34): start_stack returns false → STARTUP_FROM_APP SRSP status must
+     * be 0x02 (TI NOT_STARTED), NOT 0x01. 0x01 is TI NEW_NETWORK_STATE — a
+     * SUCCESS variant — so the old 0x01-on-failure masked a dead start_stack
+     * from generic hosts (herdsman). */
     znp_dispatch_ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.be = &FAIL_BE;
@@ -324,7 +353,7 @@ static void test_startup_failure(void) {
     CHECK(n == 6);
     CHECK(buf[2] == MT_SRSP(ZNP_ZDO));
     CHECK(buf[3] == 0x40);
-    CHECK(buf[4] == 0x01);   /* failure status */
+    CHECK(buf[4] == 0x02);   /* NOT_STARTED — honest failure (def 4) */
 }
 
 /* ── Task 4.3: ZDO_EXT_NWK_INFO (0x25/0x50) ──────────────────────────────── */
@@ -595,6 +624,240 @@ static void test_leave_ind_rejoin(void) {
     CHECK(buf[16] == 0x6F);
 }
 
+/* ── P6-T33 def tests: NV semantics + factory reset ──────────────────────── */
+
+/* def 1: STARTUP_OPTION with a clear bit set must latch a factory-new request
+ * via the backend hook; STARTUP_OPTION=0x00 must NOT. */
+static int s_factory_new_calls = 0;
+static void fake_factory_new(void) { s_factory_new_calls++; }
+
+static const znp_backend_t FAKE_FN = {
+    .get_ieee            = fake_get_ieee,
+    .request_reset       = fake_reset,
+    .apply_config        = fake_apply_config,
+    .start_stack         = fake_start_stack,
+    .bdb_commission      = fake_bdb_commission,
+    .get_nwk_info        = NULL,
+    .permit_join         = NULL,
+    .request_factory_new = fake_factory_new,
+};
+
+/* Build a SYS_OSAL_NV_WRITE_EXT (0x1D) frame: id(2 LE)+offset(2 LE)+len(2 LE)+data. */
+static size_t nv_write_ext(znp_dispatch_ctx *ctx, uint16_t id,
+                           const uint8_t *data, uint16_t dlen,
+                           uint8_t *buf, size_t cap) {
+    uint8_t pl[6 + 64];
+    pl[0] = (uint8_t)(id & 0xFF);   pl[1] = (uint8_t)(id >> 8);
+    pl[2] = 0; pl[3] = 0;
+    pl[4] = (uint8_t)(dlen & 0xFF); pl[5] = (uint8_t)(dlen >> 8);
+    if (dlen && data) memcpy(pl + 6, data, dlen);
+    mt_frame_t r = { MT_SREQ(ZNP_SYS), 0x1D, (uint8_t)(6 + dlen), pl };
+    return znp_dispatch(&r, ctx, buf, cap);
+}
+
+static void test_factory_new_latch(void) {
+    s_factory_new_calls = 0;
+    znp_dispatch_ctx ctx; memset(&ctx, 0, sizeof(ctx)); ctx.be = &FAKE_FN;
+    uint8_t buf[32];
+
+    /* STARTUP_OPTION = 0x03 (CLEAR_STATE|CLEAR_CONFIG) → latch once, SRSP ok */
+    const uint8_t opt03[1] = {0x03};
+    size_t n = nv_write_ext(&ctx, ZNP_NV_STARTUP_OPTION, opt03, 1, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_SUCCESS);
+    CHECK(s_factory_new_calls == 1);
+
+    /* STARTUP_OPTION = 0x00 → no latch, still SRSP ok */
+    const uint8_t opt00[1] = {0x00};
+    n = nv_write_ext(&ctx, ZNP_NV_STARTUP_OPTION, opt00, 1, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_SUCCESS);
+    CHECK(s_factory_new_calls == 1);   /* unchanged */
+
+    /* STARTUP_OPTION = 0x02 (CLEAR_STATE only) → latch again */
+    const uint8_t opt02[1] = {0x02};
+    nv_write_ext(&ctx, ZNP_NV_STARTUP_OPTION, opt02, 1, buf, sizeof(buf));
+    CHECK(s_factory_new_calls == 2);
+}
+
+/* def 2: length-guard uint8 wrap. NV_WRITE (0x09) dlen=pl[4]=0xFF with a short
+ * payload must NOT pass the guard / over-read; SRSP must be a failure status. */
+static void test_nv_write_len_guard_wrap(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[32];
+
+    /* osalNvWrite (0x09): id(2)+offset(2)+len(1)+data. Claim len=0xFF but supply
+     * only a tiny payload. Old code: (uint8_t)(5+255)=4, plen(7)>=4 passes →
+     * apply_nv reads 255 B. New size_t guard: plen(7) >= 5+255=260 is false. */
+    uint8_t pl[7] = { 0x83,0x00, 0x00,0x00, 0xFF, 0x34,0x12 };
+    mt_frame_t r = { MT_SREQ(ZNP_SYS), 0x09, sizeof(pl), pl };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[3] == 0x09);
+    CHECK(buf[4] == ZNP_NV_OPER_FAILED);     /* def 3: honest failure */
+    CHECK(ctx.cfg.have_pan_id == false);     /* def 2: nothing copied */
+
+    /* Same class on 0x1D: dlen16=0xFF but truncated payload → fail, no copy. */
+    znp_dispatch_ctx ctx2 = make_ctx();
+    uint8_t pl2[8] = { 0x83,0x00, 0x00,0x00, 0xFF,0x00, 0x34,0x12 };
+    mt_frame_t r2 = { MT_SREQ(ZNP_SYS), 0x1D, sizeof(pl2), pl2 };
+    n = znp_dispatch(&r2, &ctx2, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_OPER_FAILED);
+    CHECK(ctx2.cfg.have_pan_id == false);
+}
+
+/* def 3: a truncated/short value for a known id returns NV_OPER_FAILED, not
+ * a lie-success — and the well-formed write still succeeds. */
+static void test_nv_write_honest_status(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[32];
+
+    /* PRECFGKEY with only 8 bytes (16 required) → failure, key not staged. */
+    const uint8_t key8[8] = {1,2,3,4,5,6,7,8};
+    size_t n = nv_write_ext(&ctx, ZNP_NV_PRECFGKEY, key8, 8, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_OPER_FAILED);
+    CHECK(ctx.cfg.have_nwk_key == false);
+
+    /* Full 16-byte key → success. */
+    const uint8_t key16[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+    n = nv_write_ext(&ctx, ZNP_NV_PRECFGKEY, key16, 16, buf, sizeof(buf));
+    CHECK(n == 6);
+    CHECK(buf[4] == ZNP_NV_SUCCESS);
+    CHECK(ctx.cfg.have_nwk_key == true);
+}
+
+/* def 4: NV_READ of an unknown id returns NV_ITEM_UNINIT (0x02), and a known
+ * staged id reads back its value with SUCCESS. */
+static void test_nv_read_status(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[64];
+
+    /* Unknown id 0x0F00 → NV_ITEM_UNINIT, len 0. NV_READ_EXT (0x1C): id+offset. */
+    uint8_t rd_unknown[4] = { 0x00, 0x0F, 0x00, 0x00 };
+    mt_frame_t r = { MT_SREQ(ZNP_SYS), 0x1C, sizeof(rd_unknown), rd_unknown };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    CHECK(n == 7);                       /* FE+len+cmd0+cmd1+status+len0+fcs */
+    CHECK(buf[3] == 0x1C);
+    CHECK(buf[4] == ZNP_NV_ITEM_UNINIT); /* 0x02, not lie-success */
+    CHECK(buf[5] == 0x00);               /* len = 0 */
+
+    /* Stage a PANID then read it back: SUCCESS + 2-byte value. */
+    const uint8_t pan[2] = {0x34, 0x12};
+    nv_write_ext(&ctx, ZNP_NV_PANID, pan, 2, buf, sizeof(buf));
+    uint8_t rd_pan[4] = { 0x83, 0x00, 0x00, 0x00 };
+    mt_frame_t r2 = { MT_SREQ(ZNP_SYS), 0x1C, sizeof(rd_pan), rd_pan };
+    n = znp_dispatch(&r2, &ctx, buf, sizeof(buf));
+    CHECK(buf[4] == ZNP_NV_SUCCESS);
+    CHECK(buf[5] == 0x02);               /* len = 2 */
+    CHECK(buf[6] == 0x34);
+    CHECK(buf[7] == 0x12);
+}
+
+/* ── P6-T34 def tests: dispatch completeness ─────────────────────────────── */
+
+/* def 1: MGMT_PERMIT_JOIN backend hook + SRSP. */
+static int     s_permit_calls    = 0;
+static uint8_t s_permit_duration = 0xFF;
+static bool fake_permit_join(uint8_t duration_s) {
+    s_permit_calls++;
+    s_permit_duration = duration_s;
+    return true;
+}
+static const znp_backend_t PERMIT_BE = {
+    .get_ieee       = nullptr,
+    .request_reset  = fake_reset,
+    .apply_config   = nullptr,
+    .start_stack    = nullptr,
+    .bdb_commission = nullptr,
+    .get_nwk_info   = nullptr,
+    .permit_join    = fake_permit_join,
+    .request_factory_new = nullptr,
+};
+
+/* def 1: ZDO_MGMT_PERMIT_JOIN_REQ (0x36) must call backend->permit_join with the
+ * duration at payload[3] and answer a 1-byte SRSP (the byte the host blocks on).
+ * Host wire layout (zcl_commands.cpp:62): AddrMode + DstAddr(2 LE) + Dur + TCsig. */
+static void test_permit_join(void) {
+    s_permit_calls = 0; s_permit_duration = 0xFF;
+    znp_dispatch_ctx ctx; memset(&ctx, 0, sizeof(ctx)); ctx.be = &PERMIT_BE;
+    uint8_t buf[32];
+
+    /* duration = 60s; AddrMode=0x0F, DstAddr=0xFFFC LE, TCsig=0x01 */
+    const uint8_t pl[5] = {0x0F, 0xFC, 0xFF, 60, 0x01};
+    mt_frame_t r = { MT_SREQ(ZNP_ZDO), 0x36, sizeof(pl), pl };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+
+    /* SRSP: MT_SRSP(ZNP_ZDO)/0x36, status 0x00. FCS=0x01^0x65^0x36^0x00=0x52 */
+    const uint8_t expect[6] = {0xFE, 0x01, 0x65, 0x36, 0x00, 0x52};
+    CHECK(n == 6);
+    CHECK(memcmp(buf, expect, 6) == 0);
+    CHECK(s_permit_calls == 1);
+    CHECK(s_permit_duration == 60);   /* duration read from payload[3] */
+
+    /* def 1: companion MGMT_PERMIT_JOIN_RSP AREQ builder (0x45/0xB6).
+     * src=0x0000, status=0x00 → FE 03 45 B6 00 00 00 F0  (8 bytes: 5 overhead + 3)
+     * FCS = 0x03^0x45^0xB6^0x00^0x00^0x00 = 0xF0 */
+    size_t m = znp_build_permit_join_rsp(0x0000, 0x00, buf, sizeof(buf));
+    const uint8_t exp_rsp[8] = {0xFE, 0x03, 0x45, 0xB6, 0x00, 0x00, 0x00, 0xF0};
+    CHECK(m == 8);
+    CHECK(memcmp(buf, exp_rsp, 8) == 0);
+}
+
+/* def 2: an unhandled SREQ across every routed subsystem must RPC-error (not 0).
+ * Covers the host's real silent-drop victims: ZDO interview 0x02/0x04/0x05,
+ * MGMT_LEAVE 0x34, MSG_CB_REGISTER 0x3E, AF_DATA_REQUEST 0x01. */
+static void test_rpc_error_unhandled(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[32];
+    const struct { uint8_t cmd0, cmd1; } victims[] = {
+        { MT_SREQ(ZNP_ZDO), 0x02 },  /* NODE_DESC_REQ   */
+        { MT_SREQ(ZNP_ZDO), 0x04 },  /* SIMPLE_DESC_REQ */
+        { MT_SREQ(ZNP_ZDO), 0x05 },  /* ACTIVE_EP_REQ   */
+        { MT_SREQ(ZNP_ZDO), 0x34 },  /* MGMT_LEAVE_REQ  */
+        { MT_SREQ(ZNP_ZDO), 0x3E },  /* MSG_CB_REGISTER */
+        { MT_SREQ(ZNP_AF),  0x01 },  /* AF_DATA_REQUEST */
+    };
+    for (size_t i = 0; i < sizeof(victims)/sizeof(victims[0]); i++) {
+        mt_frame_t r = { victims[i].cmd0, victims[i].cmd1, 0, nullptr };
+        size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+        /* RPC-error frame: FE 03 60 00 02 <cmd0> <cmd1> FCS */
+        CHECK(n == 8);
+        CHECK(buf[0] == 0xFE);
+        CHECK(buf[1] == 0x03);
+        CHECK(buf[2] == 0x60);            /* MT_SRSP(0) — RPC subsystem 0 */
+        CHECK(buf[3] == 0x00);
+        CHECK(buf[4] == 0x02);            /* MT_RPC_ERR_COMMAND_ID */
+        CHECK(buf[5] == victims[i].cmd0); /* echoed offending cmd0 */
+        CHECK(buf[6] == victims[i].cmd1); /* echoed offending cmd1 */
+    }
+
+    /* CRITICAL: RPC-error must NOT shadow a real handler. The now-implemented
+     * 0x36 (permit-join) and the existing handlers must still produce their own
+     * SRSP, never the RPC-error frame. */
+    znp_dispatch_ctx pctx; memset(&pctx, 0, sizeof(pctx)); pctx.be = &PERMIT_BE;
+    const uint8_t pjpl[5] = {0x0F, 0xFC, 0xFF, 10, 0x01};
+    mt_frame_t pj = { MT_SREQ(ZNP_ZDO), 0x36, sizeof(pjpl), pjpl };
+    size_t np = znp_dispatch(&pj, &pctx, buf, sizeof(buf));
+    CHECK(np == 6);
+    CHECK(buf[2] == MT_SRSP(ZNP_ZDO));   /* real SRSP, not 0x60 RPC-error */
+    CHECK(buf[3] == 0x36);
+}
+
+/* def 3: SYS_RESET_REQ in AREQ form (0x41/0x00) must reach the SAME reset path
+ * as the SREQ form (T33). Generic/herdsman hosts send the AREQ form. No SRSP. */
+static void test_areq_reset(void) {
+    znp_dispatch_ctx ctx = make_ctx();
+    uint8_t buf[32];
+    int before = s_reset_calls;
+    /* AREQ SYS_RESET_REQ: cmd0 = MT_AREQ(ZNP_SYS) = 0x41, cmd1 = 0x00 */
+    mt_frame_t r = { MT_AREQ(ZNP_SYS), 0x00, 0, nullptr };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    CHECK(n == 0);                         /* no SRSP — host waits for RESET_IND */
+    CHECK(s_reset_calls == before + 1);    /* same request_reset path */
+}
+
 /* ── main ────────────────────────────────────────────────────────────────── */
 
 int main() {
@@ -625,6 +888,15 @@ int main() {
     test_tc_dev_ind_overflow();
     test_leave_ind();
     test_leave_ind_rejoin();
+    /* new (P6-T33: NV semantics + factory reset) */
+    test_factory_new_latch();
+    test_nv_write_len_guard_wrap();
+    test_nv_write_honest_status();
+    test_nv_read_status();
+    /* new (P6-T34: dispatch completeness) */
+    test_permit_join();
+    test_rpc_error_unhandled();
+    test_areq_reset();
 
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all znp_dispatch tests passed\n");

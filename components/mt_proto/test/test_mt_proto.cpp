@@ -46,6 +46,14 @@ static void test_encode() {
     mt_frame_t toobig = { MT_SREQ(ZNP_AF), 0x01, 251, big };
     uint8_t b3[260];
     CHECK(mt_encode(&toobig, b3, sizeof(b3)) == 0);
+
+    /* P6-T37 def 5: NULL payload with non-zero len -> 0 (no NULL deref) */
+    mt_frame_t nullpl = { MT_SREQ(ZNP_AF), 0x01, 4, nullptr };
+    uint8_t b4[16];
+    CHECK(mt_encode(&nullpl, b4, sizeof(b4)) == 0);
+    /* NULL payload with len 0 is still legal (e.g. SYS_PING) and must encode */
+    mt_frame_t nulllen0 = { MT_SREQ(ZNP_SYS), 0x01, 0, nullptr };
+    CHECK(mt_encode(&nulllen0, b4, sizeof(b4)) == 5);
 }
 
 static void test_decode() {
@@ -127,11 +135,92 @@ static void test_parser() {
     CHECK(d3 == 1 && out.payload_len == 2 && out.payload[1] == 0x00);
 }
 
+/* P6-T37 def 4: the reject (LEN over-length) and FCS-fail paths must re-examine
+ * the offending byte as a possible SOF instead of discarding it, so a valid frame
+ * whose SOF lands immediately on a reject boundary is NOT lost. */
+static void test_parser_resync() {
+    mt_parser_t p; mt_parser_reset(&p);
+    mt_frame_t out;
+    const uint8_t ping[5] = {0xFE, 0x00, 0x21, 0x01, 0x20};
+
+    /* (a) LEN-reject where the over-length LEN byte is itself 0xFE = the SOF of
+     * the next (valid) frame. FE(SOF) FE(LEN=254 -> reject, but byte==SOF) then
+     * the remaining 4 ping bytes complete the frame. */
+    mt_parser_reset(&p);
+    CHECK(mt_parser_feed(&p, 0xFE, &out) == 0);   /* SOF -> state 1 */
+    CHECK(mt_parser_feed(&p, 0xFE, &out) == 0);   /* LEN=254 reject; byte is SOF -> state 1 */
+    CHECK(mt_parser_feed(&p, ping[1], &out) == 0);/* LEN=0 */
+    CHECK(mt_parser_feed(&p, ping[2], &out) == 0);/* CMD0 */
+    CHECK(mt_parser_feed(&p, ping[3], &out) == 0);/* CMD1 */
+    CHECK(mt_parser_feed(&p, ping[4], &out) == 1);/* FCS -> frame emitted (NOT lost) */
+    CHECK(out.cmd0 == 0x21 && out.cmd1 == 0x01 && out.payload_len == 0);
+
+    /* (b) LEN-reject where the over-length LEN byte is NOT a SOF -> dropped, then
+     * a fresh full valid frame parses normally (no spurious state carried over). */
+    mt_parser_reset(&p);
+    CHECK(mt_parser_feed(&p, 0xFE, &out) == 0);   /* SOF */
+    CHECK(mt_parser_feed(&p, 0xFB, &out) == 0);   /* LEN=251 reject; 0xFB != SOF -> state 0 */
+    int da = 0;
+    for (int i = 0; i < 5; i++) da = mt_parser_feed(&p, ping[i], &out);
+    CHECK(da == 1 && out.cmd0 == 0x21);
+
+    /* (c) FCS-fail where the failing FCS byte is 0xFE, the SOF of the next frame.
+     * Build a ping with a deliberately-wrong FCS of 0xFE, then the 4 remaining
+     * ping bytes; the second frame must parse (the 0xFE FCS is preserved as SOF). */
+    mt_parser_reset(&p);
+    const uint8_t badfcs_is_sof[5] = {0xFE, 0x00, 0x21, 0x01, 0xFE}; /* correct FCS is 0x20 */
+    for (int i = 0; i < 4; i++) CHECK(mt_parser_feed(&p, badfcs_is_sof[i], &out) == 0);
+    CHECK(mt_parser_feed(&p, badfcs_is_sof[4], &out) == 0);  /* FCS fail; byte 0xFE -> SOF */
+    /* the 0xFE was preserved as SOF -> now feed LEN/CMD0/CMD1/FCS of a valid ping */
+    CHECK(mt_parser_feed(&p, ping[1], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[2], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[3], &out) == 0);
+    CHECK(mt_parser_feed(&p, ping[4], &out) == 1);  /* valid frame after FCS-fail NOT lost */
+    CHECK(out.cmd0 == 0x21 && out.cmd1 == 0x01);
+
+    /* (d) FCS-fail where the failing FCS byte is NOT a SOF -> next full valid
+     * frame still parses (regression guard for the existing recovery path). */
+    mt_parser_reset(&p);
+    const uint8_t badf[5] = {0xFE, 0x00, 0x21, 0x01, 0xFF}; /* FCS 0xFF != 0x20, != SOF */
+    for (int i = 0; i < 5; i++) mt_parser_feed(&p, badf[i], &out);
+    int dd = 0;
+    for (int i = 0; i < 5; i++) dd = mt_parser_feed(&p, ping[i], &out);
+    CHECK(dd == 1 && out.cmd0 == 0x21);
+}
+
+/* P6-T37 def 4: forward-progress invariant under a 0xFE flood. A run of SOF
+ * bytes drives SOF-hunt -> LEN-pending repeatedly (LEN=0xFE over-length ->
+ * resync, byte is SOF -> back to LEN-pending). Each feed must consume exactly
+ * one byte and return 0 (no false emit, no spin / re-processing of a byte), and
+ * a valid frame immediately after the flood must still decode. This locks the
+ * one-byte-per-call invariant a parser refactor could silently break. */
+static void test_parser_flood_forward_progress() {
+    mt_parser_t p; mt_parser_reset(&p);
+    mt_frame_t out;
+    const uint8_t ping[5] = {0xFE, 0x00, 0x21, 0x01, 0x20};
+
+    /* 1000 consecutive SOF bytes: every call returns 0, none emits a frame. */
+    for (int i = 0; i < 1000; i++) {
+        CHECK(mt_parser_feed(&p, 0xFE, &out) == 0);
+    }
+    /* The trailing 0xFE left the parser in LEN-pending. ping[0]=0xFE is another
+     * over-length LEN -> resync (byte is SOF) -> LEN-pending again; then the
+     * real LEN/CMD0/CMD1/FCS complete the frame. Valid frame NOT lost. */
+    CHECK(mt_parser_feed(&p, ping[0], &out) == 0);  /* LEN=0xFE reject; SOF -> re-armed */
+    CHECK(mt_parser_feed(&p, ping[1], &out) == 0);  /* LEN=0 */
+    CHECK(mt_parser_feed(&p, ping[2], &out) == 0);  /* CMD0 */
+    CHECK(mt_parser_feed(&p, ping[3], &out) == 0);  /* CMD1 */
+    CHECK(mt_parser_feed(&p, ping[4], &out) == 1);  /* FCS -> frame */
+    CHECK(out.cmd0 == 0x21 && out.cmd1 == 0x01 && out.payload_len == 0);
+}
+
 int main() {
     test_fcs();
     test_encode();
     test_decode();
     test_parser();
+    test_parser_resync();
+    test_parser_flood_forward_progress();
     if (g_fail) { printf("%d CHECK(s) failed\n", g_fail); return 1; }
     printf("all mt_proto tests passed\n");
     return 0;
