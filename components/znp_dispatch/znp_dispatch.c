@@ -258,6 +258,18 @@ static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
         case 0x40: {
             uint8_t status = 0x00;   /* success (restored) */
             if (be && be->apply_config) be->apply_config(ctx ? &ctx->cfg : NULL);
+            /* T36 / FINDINGS §12 MED (def 4): the network key (PRECFGKEY) was
+             * staged into ctx->cfg by an earlier osalNvWrite and has now been
+             * consumed by apply_config (the backend copied it into its own
+             * pending buffer + handed it to the stack). Zeroize this dispatch-ctx
+             * copy (== app_main's s_ctx.cfg) so the cleartext key does not linger
+             * in RAM for the process lifetime, and clear the have-flag so a later
+             * re-read of NV doesn't echo a wiped key. The backend zeroizes its
+             * own copy at its apply site (znp_ezb.c). */
+            if (ctx) {
+                memset(ctx->cfg.nwk_key, 0, sizeof(ctx->cfg.nwk_key));
+                ctx->cfg.have_nwk_key = false;
+            }
             if (be && be->start_stack && !be->start_stack()) status = 0x02; /* NOT_STARTED */
             return encode_srsp_sub(ZNP_ZDO, 0x40, &status, 1, buf, cap);
         }

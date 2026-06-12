@@ -55,6 +55,37 @@ static void cache_nwk_info(void)
     s_cached_short = (uint16_t)ezb_nwk_get_short_address();
 }
 
+/* T36 / FINDINGS §12 MED (def 3): invalidate the cached identity when the
+ * network goes down (self-leave / steering-fail / NWK failure). Reset to the
+ * "no network" sentinels so a host ZDO_EXT_NWK_INFO poll after the network dies
+ * reads a coherent down state, not a stale panid/short from the dead network.
+ * Lockless — only ever called from the signal handler (callback ctx). */
+static void invalidate_nwk_info(void)
+{
+    s_cached_panid = 0xFFFFu;
+    s_cached_short = 0xFFFEu;
+}
+
+/* T36 / FINDINGS §12 MED (def 2 + def 3): bring the network up/down as ONE
+ * ordered operation. On up: cache the identity FIRST, then publish s_net_up —
+ * so a concurrent EXT_NWK_INFO reader never observes dev_state=0x09 paired with
+ * a stale panid 0xFFFF. On down: clear s_net_up FIRST, then invalidate the
+ * cache — so a reader never observes dev_state=0x09 paired with a wiped panid.
+ * Both run lockless in the signal handler (callback ctx); the 16-bit + bool
+ * stores are individually atomic on RISC-V, and the ordering closes the window
+ * the reader cares about (it gates the panid read on dev_state==0x09). */
+static void set_net_up(void)
+{
+    cache_nwk_info();
+    s_net_up = true;
+}
+
+static void set_net_down(void)
+{
+    s_net_up = false;
+    invalidate_nwk_info();
+}
+
 /* ── IEEE / reset (unchanged from stub) ─────────────────────────────────── */
 
 static void ezb_get_ieee(uint8_t out[8])
@@ -63,9 +94,14 @@ static void ezb_get_ieee(uint8_t out[8])
     /* 802.15.4 EUI64 from efuse. esp_read_mac returns it MSB-first; the MT
      * ExtAddr field is little-endian, so reverse. VERIFY orientation on first
      * P4 hardware bring-up (compare P4 log vs chip label). */
-    if (esp_read_mac(mac, ESP_MAC_IEEE802154) == ESP_OK) {
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_IEEE802154);
+    if (err == ESP_OK) {
         for (int i = 0; i < 8; i++) out[i] = mac[7 - i];
     } else {
+        /* T36 / FINDINGS §12 LOW (def 5): an all-zero IEEE is an invalid EUI64
+         * the host may accept as the coordinator address — surface the read
+         * failure instead of silently serving zeros. */
+        ESP_LOGE(TAG, "esp_read_mac(IEEE802154) failed: %d — serving all-zero IEEE", err);
         memset(out, 0, 8);
     }
 }
@@ -157,12 +193,66 @@ static volatile bool s_bring_up_ok    = false;  /* worker reached launch_mainloo
 static void ezb_apply_config(const znp_netcfg_t *cfg)
 {
     if (!cfg) return;
+
+    /* T36 / FINDINGS §12 MED (def 3b): once the stack has started, the buffered
+     * config has ALREADY been consumed in bring_up_steps (step 3, gated on
+     * s_af_registered) and start_stack is idempotent-true thereafter. Re-staging
+     * here would silently swallow the new config — the host's NV writes get an
+     * ACK but never take effect, with no path to apply them. The ezb_set_*
+     * setters only apply pre-init/pre-start, so a live post-start re-config is
+     * not honestly applicable in-place; it requires a reset to re-run bring-up.
+     *
+     * Honest path: do NOT pretend to stage it. Log loudly that the post-start
+     * config will not take effect until a reset (the host's STARTUP_OPTION-clear
+     * + SYS_RESET factory-new flow, T33, is the supported way to re-key/re-PAN a
+     * running coordinator). The NV-write SRSP already reported acceptance into
+     * the cfg buffer for the protocol layer; this log is the operator-visible
+     * signal that a running-stack reconfigure needs a reboot to land. */
+    if (s_zb_started) {
+        ESP_LOGW(TAG, "apply_config after stack start: buffered net config will NOT "
+                      "take effect until reset (host must STARTUP_OPTION-clear + reset to re-key/re-PAN)");
+        return;   /* do not overwrite the already-consumed s_pending_cfg */
+    }
+
     s_pending_cfg      = *cfg;
     s_have_pending_cfg = true;
 }
 
 /* ── Signal handler — forward-declared for use in the bring-up worker ────── */
 static bool s_signal_handler(const ezb_app_signal_t *signal);
+
+/* T36 / FINDINGS §12 LOW (def 5): the STATE_CHANGE_IND AREQ is state-bearing —
+ * the host's commissioning gate polls for state=9 within a 10 s window (per
+ * T35's finding). A single dropped frame (200 ms TX-mutex-timeout) silently
+ * stalls that gate with no host retry. znp_uart_send_raw already logs the drop,
+ * but a one-shot send has no recovery, so retry a few times before giving up,
+ * and LOG loudly if every attempt fails (vs. the previous silent ignore of the
+ * return value). Runs in the signal-handler (callback) ctx; the short bounded
+ * retries are acceptable there — the mainloop is not latency-critical at the
+ * moment the network transitions up. */
+#define ZNP_AREQ_RETRY_ATTEMPTS  3
+static void send_state_change_ind(uint8_t dev_state)
+{
+    uint8_t buf[32];
+    size_t  n = znp_build_state_change_ind(dev_state, buf, sizeof(buf));
+    if (!n) {
+        ESP_LOGE(TAG, "state_change_ind(state=0x%02x): build failed", dev_state);
+        return;
+    }
+    for (int attempt = 1; attempt <= ZNP_AREQ_RETRY_ATTEMPTS; attempt++) {
+        if (znp_uart_send_raw(buf, n)) {
+            return;   /* sent */
+        }
+        ESP_LOGW(TAG, "state_change_ind(state=0x%02x): send attempt %d/%d failed",
+                 dev_state, attempt, ZNP_AREQ_RETRY_ATTEMPTS);
+    }
+    /* All retries exhausted: a state=9 the host never sees hangs its 10 s
+     * commissioning gate. Make the failure LOUD so it shows in the log instead
+     * of a silent stall. The host's own state-timeout → STARTUP retry remains
+     * the upper-layer recovery. */
+    ESP_LOGE(TAG, "state_change_ind(state=0x%02x): DROPPED after %d attempts — "
+                  "host commissioning gate may stall", dev_state, ZNP_AREQ_RETRY_ATTEMPTS);
+}
 
 /* ── Stack bring-up — runs on the dedicated worker task, NOT the RX task ──── *
  * def 3 / FINDINGS §12 HIGH: the entire ZBOSS bring-up (NVRAM erase, init, AF
@@ -269,6 +359,16 @@ static bool bring_up_steps(void)
             }
             if (c->have_nwk_key) {
                 ezb_secur_set_network_key(c->nwk_key);
+                /* T36 / FINDINGS §12 MED (def 4): the network key is security-
+                 * sensitive — once the stack has consumed it, zeroize our staged
+                 * copy so the cleartext key does not linger in RAM for the
+                 * process lifetime (open-source release: don't leave keys in
+                 * memory). Clear the have-flag too so a resume/retry doesn't
+                 * re-push a wiped (all-zero) key over the live one. NOTE: this is
+                 * the worker's s_pending_cfg copy; app_main's znp_dispatch_ctx
+                 * copy (s_ctx.cfg) is zeroized at its own apply site (app_main.c). */
+                memset(s_pending_cfg.nwk_key, 0, sizeof(s_pending_cfg.nwk_key));
+                s_pending_cfg.have_nwk_key = false;
             }
         }
         /* Always force coordinator role */
@@ -340,7 +440,16 @@ static void ezb_worker_task(void *arg)
     }
     s_bring_up_ok = true;
     ESP_LOGI(TAG, "stack bring-up complete — entering mainloop");
-    esp_zigbee_launch_mainloop();   /* blocks until shutdown (never in normal op) */
+    /* T36 / FINDINGS §12 LOW (def 5): launch_mainloop returns esp_err_t and
+     * normally never returns. If it DOES return, the stack has shut down and the
+     * NCP is silently radio-dead (network goes down with the loop). Mark the
+     * network down (def 3) and LOG the err before self-deleting, so the failure
+     * shows in the log instead of a silent task exit. */
+    esp_err_t loop_err = esp_zigbee_launch_mainloop();   /* blocks until shutdown (never in normal op) */
+    set_net_down();
+    ESP_LOGE(TAG, "esp_zigbee_launch_mainloop returned %d — mainloop exited, NCP radio-dead",
+             loop_err);
+    s_bring_up_ok = false;
     vTaskDelete(NULL);
 }
 
@@ -460,14 +569,28 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
     /* ── BDB first-start / reboot: device booted into its network ──────────── */
     case EZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case EZB_BDB_SIGNAL_DEVICE_REBOOT: {
-        /* These signals mean the stack has initialised/rejoined its network.
-         * No status check required — the signal itself is the success indicator. */
-        s_net_up = true;
-        cache_nwk_info();
-        n = znp_build_state_change_ind(0x09u, buf, sizeof(buf));
-        if (n) znp_uart_send_raw(buf, n);
-        ESP_LOGI(TAG, "signal 0x%04x: device boot/reboot, network up, state_change_ind sent",
-                 sig_type);
+        /* T36 / FINDINGS §12 HIGH (def 1): these signals are NOT unconditional
+         * success — they carry ezb_bdb_signal_simple_params_t with a status
+         * field exactly like FORMATION/STEERING. A factory-new init that fails,
+         * or a REBOOT that can't restore the NVRAM network, still raises the
+         * signal but with a non-SUCCESS status. The old code declared net-up and
+         * emitted STATE_CHANGE_IND(0x09) regardless, telling the host a DEAD
+         * network was a live coordinator. Require EZB_BDB_STATUS_SUCCESS (== 0),
+         * matching the FORMATION/STEERING pattern below. */
+        const ezb_bdb_signal_simple_params_t *p =
+            ezb_app_signal_get_params(signal);
+        if (p != NULL && p->status == EZB_BDB_STATUS_SUCCESS) {
+            set_net_up();                 /* cache identity BEFORE publishing up (def 2) */
+            send_state_change_ind(0x09u); /* retry-on-drop, loud-log (def 5) */
+            ESP_LOGI(TAG, "signal 0x%04x: device boot/reboot success, network up, state_change_ind sent",
+                     sig_type);
+        } else {
+            /* A failed boot/reboot must not resurrect a stale net-up. Clear it
+             * defensively (def 3) so a host poll reads down, not a lie. */
+            set_net_down();
+            ESP_LOGW(TAG, "signal 0x%04x: device boot/reboot FAILED or no params (status=%d) — network NOT up",
+                     sig_type, p ? (int)p->status : -1);
+        }
         return false;   /* let other handlers see it too */
     }
 
@@ -477,14 +600,16 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
         const ezb_bdb_signal_simple_params_t *p =
             ezb_app_signal_get_params(signal);
         if (p != NULL && p->status == EZB_BDB_STATUS_SUCCESS) {
-            s_net_up = true;
-            cache_nwk_info();
-            n = znp_build_state_change_ind(0x09u, buf, sizeof(buf));
-            if (n) znp_uart_send_raw(buf, n);
+            set_net_up();                 /* cache identity BEFORE publishing up (def 2) */
+            send_state_change_ind(0x09u); /* retry-on-drop, loud-log (def 5) */
             ESP_LOGI(TAG, "signal 0x%04x: formation/steering success, network up, state_change_ind sent",
                      sig_type);
         } else {
-            ESP_LOGW(TAG, "signal 0x%04x: formation/steering failed or no params (status=%d)",
+            /* T36 / FINDINGS §12 MED (def 3): a steering/formation FAILURE must
+             * clear any prior net-up + invalidate the cached identity so the NCP
+             * stops reporting DEV_ZB_COORD over a network that never formed. */
+            set_net_down();
+            ESP_LOGW(TAG, "signal 0x%04x: formation/steering failed or no params (status=%d) — network NOT up",
                      sig_type, p ? (int)p->status : -1);
         }
         return false;   /* let other handlers see it too */
@@ -537,6 +662,32 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
                                 remove, rejoin, buf, sizeof(buf));
         if (n) znp_uart_send_raw(buf, n);
         ESP_LOGI(TAG, "LEAVE_INDICATION nwk=0x%04x leave_ind sent", p->short_addr);
+        return false;
+    }
+
+    /* ── ZDO self-leave: THIS coordinator left its network ───────────────── *
+     * T36 / FINDINGS §12 MED (def 3). Distinct from LEAVE_INDICATION (a child
+     * left): EZB_ZDO_SIGNAL_LEAVE means our own node left (e.g. a reset-type
+     * leave). The network is gone — clear s_net_up + invalidate the cached
+     * identity so the NCP stops reporting DEV_ZB_COORD with a stale panid. */
+    case EZB_ZDO_SIGNAL_LEAVE: {
+        set_net_down();
+        ESP_LOGW(TAG, "ZDO_SIGNAL_LEAVE: self left network — net DOWN, cache invalidated");
+        return false;
+    }
+
+    /* ── NWK failure: the network reported a failure status ──────────────── *
+     * T36 / FINDINGS §12 MED (def 3). EZB_NWK_SIGNAL_NETWORK_STATUS carries an
+     * ezb_nwk_network_status_t error code. We do not have a fine-grained
+     * "network terminated" signal here, so on a reported NWK failure we
+     * conservatively mark the network down so the host re-polls / re-commissions
+     * rather than trusting a possibly-dead network as up. */
+    case EZB_NWK_SIGNAL_NETWORK_STATUS: {
+        const ezb_nwk_signal_network_status_params_t *p =
+            ezb_app_signal_get_params(signal);
+        set_net_down();
+        ESP_LOGW(TAG, "NWK_SIGNAL_NETWORK_STATUS status=0x%02x — net marked DOWN",
+                 p ? (unsigned)p->status : 0xFFu);
         return false;
     }
 

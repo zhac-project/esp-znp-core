@@ -8,6 +8,53 @@ follow the platform-wide `vYYYYMMDDVV` scheme.
 
 ### Security
 
+- **Commissioning signal / network-state integrity** (HIGH/MED/LOW, FINDINGS
+  §12, T36, `znp_ezb.c` / `znp_dispatch.c` / `app_main.c`): the signal handler and
+  net-state tracking reported a dead network as up and left the network key in
+  RAM. Fixed defensively, preserving T35's lock discipline (no lock acquire and
+  no cross-task helpers added inside the signal handler).
+  - **HIGH — net-up declared on a dead network** (`znp_ezb.c` `s_signal_handler`,
+    `EZB_BDB_SIGNAL_DEVICE_FIRST_START` / `..._DEVICE_REBOOT`): these were treated
+    as unconditional success, but they carry `ezb_bdb_signal_simple_params_t` with
+    a `status` field exactly like FORMATION/STEERING. A failed factory-new init or
+    a REBOOT that could not restore the NVRAM network still declared net-up and
+    emitted `STATE_CHANGE_IND(0x09)` to the host — a live coordinator over a dead
+    radio. Now require `EZB_BDB_STATUS_SUCCESS` (== 0), matching the
+    FORMATION/STEERING case; a non-success status marks the network down instead.
+  - **MED — `s_net_up` published before the identity cache** (`set_net_up`): the
+    flag was set true before `cache_nwk_info()`, so a concurrent
+    `ZDO_EXT_NWK_INFO` (0x50) host poll could read `dev_state=0x09` paired with a
+    stale `panid 0xFFFF`. Bring-up is now one ordered op — cache identity FIRST,
+    then publish `s_net_up`. The down transition (`set_net_down`) clears
+    `s_net_up` first, then invalidates the cache, so the reader never sees up+wiped.
+  - **MED — `s_net_up` never cleared on network loss** (`set_net_down`): the flag
+    was never reset, so the NCP reported `DEV_ZB_COORD` forever after the network
+    died. Now cleared + cached identity invalidated on self-leave
+    (`EZB_ZDO_SIGNAL_LEAVE`), steering/formation failure, NWK failure
+    (`EZB_NWK_SIGNAL_NETWORK_STATUS`), and a returned `launch_mainloop`.
+  - **MED — post-start NV config silently lost** (`ezb_apply_config`): once the
+    stack is started the buffered config has already been consumed and
+    `start_stack` is idempotent-true, so a post-start `apply_config` re-staged
+    config that never applied — the host's NV writes were ACK'd but ignored with
+    no path to take effect. Now detected: an honest loud `ESP_LOGW` states the
+    config will not take effect until a reset (the host's STARTUP_OPTION-clear +
+    `SYS_RESET` factory-new flow re-keys/re-PANs a running coordinator), and the
+    already-consumed buffer is not overwritten.
+  - **MED — network key not zeroized** (`ezb_apply_config`/bring-up +
+    `znp_dispatch.c` 0x40): the cleartext network key lingered in `s_pending_cfg`
+    (backend) and in the dispatch ctx (`s_ctx.cfg`, app_main) for the process
+    lifetime after `ezb_secur_set_network_key` consumed it. Now `memset` to zero
+    + `have_nwk_key=false` at BOTH sites once consumed (open-source release: keys
+    must not persist in RAM).
+  - **LOW — ignored results / silent fallbacks** (def 5): the state-bearing
+    `STATE_CHANGE_IND` AREQ send result was ignored — a 200 ms TX-mutex-timeout
+    silently dropped state=9 and stalled the host's 10 s commissioning gate with
+    no retry; now sent via `send_state_change_ind` with bounded retry + a loud
+    `ESP_LOGE` on exhaustion. `esp_read_mac` failure (serving an all-zero IEEE),
+    `esp_zigbee_launch_mainloop`'s discarded return (silent task self-delete), the
+    `app_main` `on_frame` SRSP send failure, and the boot `RESET_IND` build/send
+    result are now all logged instead of ignored.
+
 - **Unlocked cross-task stack calls + bring-up on the RX task** (CRIT, FINDINGS
   §12, T35, `znp_ezb.c` / `znp_uart.c`): the Zigbee stack task/lock structure was
   unsafe in four ways.
