@@ -50,7 +50,14 @@ follow the platform-wide `vYYYYMMDDVV` scheme.
   offending cmd0, offending cmd1}`), turning the triple-timeout into one
   immediate honest error until each command is actually implemented. This is the
   DEFAULT fall-through only — it never shadows a real handler (incl. the new
-  0x36); unrouted **AREQs** stay silent (fire-and-forget).
+  0x36); unrouted **AREQs** stay silent (fire-and-forget). Note: this is
+  protocol-correctness for generic/herdsman-class hosts. The current host
+  (`znp_driver`) correlates SRSPs by subsystem+cmd1, so it does not yet match a
+  `0x60/0x00` RPC-error and still times out on unknown SREQs; shortening the
+  current-host timeout needs a cross-repo follow-up — teach `znp_driver` to
+  recognize the MT RPC-error frame and fail the pending SREQ. The same caveat
+  applies to the STARTUP `0x02` status above (the current host ignores the status
+  byte).
 - **AREQ-typed SYS_RESET_REQ unrouted** (MED, FINDINGS §12, T34,
   `znp_dispatch.c` `znp_dispatch`): routing matched SREQ type-bits only, so
   generic Z-Stack hosts / zigbee-herdsman that send `SYS_RESET_REQ` as an AREQ

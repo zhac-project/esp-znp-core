@@ -32,9 +32,12 @@ static void put_le64(uint8_t *out, uint64_t v) {
  * MONITOR-TEST RPC-error frame instead: SRSP of the RPC-subsystem 0 (cmd0=0x60,
  * cmd1=0x00) with payload {errorcode, jcmd0, jcmd1} echoing the offending
  * header. errorcode 0x02 = MT_RPC_ERR_COMMAND_ID (subsystem/cmd not supported).
- * This turns triple-timeout dead-air into one immediate honest error until the
- * command is actually implemented (out of scope here). DEFAULT fall-through
- * ONLY — it must never shadow a real handler (incl. the new 0x36). */
+ * This turns triple-timeout dead-air into one immediate honest error FOR HOSTS
+ * THAT CORRELATE IT (generic/herdsman-class); the current znp_driver host
+ * matches SRSPs by subsystem+cmd1 and does not yet correlate the 0x60/0x00
+ * RPC-error — see CHANGELOG. Honest error until the command is actually
+ * implemented (out of scope here). DEFAULT fall-through ONLY — it must never
+ * shadow a real handler (incl. the new 0x36). */
 #define ZNP_RPC_ERR_INVALID_CMD  0x02   /* MT_RPC_ERR_COMMAND_ID */
 static size_t encode_rpc_error(const mt_frame_t *req, uint8_t errcode,
                                uint8_t *buf, size_t cap) {
