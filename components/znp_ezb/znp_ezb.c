@@ -676,18 +676,27 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
         return false;
     }
 
-    /* ── NWK failure: the network reported a failure status ──────────────── *
+    /* ── NWK status: per-frame routing diagnostics — NOT a net-down trigger ── *
      * T36 / FINDINGS §12 MED (def 3). EZB_NWK_SIGNAL_NETWORK_STATUS carries an
-     * ezb_nwk_network_status_t error code. We do not have a fine-grained
-     * "network terminated" signal here, so on a reported NWK failure we
-     * conservatively mark the network down so the host re-polls / re-commissions
-     * rather than trusting a possibly-dead network as up. */
+     * ezb_nwk_signal_network_status_params_t{status, network_addr, ...} where
+     * `status` is a per-FRAME NWK command status (NO_ROUTE_AVAILABLE 0x00,
+     * LINK_FAILURE 0x02, INDIRECT_TRANSACTION_EXPIRY 0x06, TARGET_DEVICE_
+     * UNAVAILABLE 0x07, VALIDATE_ROUTE 0x0a, MANY_TO_ONE_ROUTE_FAILURE 0x0c, …
+     * see ezbee/nwk.h) describing a route/delivery event for ANOTHER device.
+     * These fire ROUTINELY on a HEALTHY coordinator (a sleepy end-device misses
+     * an indirect poll → 0x06; a transient route blip → 0x00) and do NOT mean
+     * "this coordinator's network terminated". Treating them as net-down would
+     * flap s_net_up false (cache wiped, dev_state→0x00, panid→0xFFFF reported)
+     * with no signal re-asserting up except a fresh FORMATION/REBOOT → churn.
+     * So this is logged as informational/diagnostic only; s_net_up is left
+     * untouched. The real net-down triggers are self-leave (ZDO_SIGNAL_LEAVE)
+     * and formation/steering-fail above. */
     case EZB_NWK_SIGNAL_NETWORK_STATUS: {
         const ezb_nwk_signal_network_status_params_t *p =
             ezb_app_signal_get_params(signal);
-        set_net_down();
-        ESP_LOGW(TAG, "NWK_SIGNAL_NETWORK_STATUS status=0x%02x — net marked DOWN",
-                 p ? (unsigned)p->status : 0xFFu);
+        ESP_LOGD(TAG, "NWK_SIGNAL_NETWORK_STATUS status=0x%02x nwk=0x%04x (per-frame routing diagnostic, net unchanged)",
+                 p ? (unsigned)p->status : 0xFFu,
+                 p ? (unsigned)p->network_addr : 0xFFFFu);
         return false;
     }
 

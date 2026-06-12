@@ -29,9 +29,12 @@ follow the platform-wide `vYYYYMMDDVV` scheme.
     `s_net_up` first, then invalidates the cache, so the reader never sees up+wiped.
   - **MED — `s_net_up` never cleared on network loss** (`set_net_down`): the flag
     was never reset, so the NCP reported `DEV_ZB_COORD` forever after the network
-    died. Now cleared + cached identity invalidated on self-leave
-    (`EZB_ZDO_SIGNAL_LEAVE`), steering/formation failure, NWK failure
-    (`EZB_NWK_SIGNAL_NETWORK_STATUS`), and a returned `launch_mainloop`.
+    died. Self-leave (`EZB_ZDO_SIGNAL_LEAVE`) + formation/steering-fail clear
+    net-up (and invalidate the cached identity); a returned `launch_mainloop` also
+    clears it. Per-frame NWK status (`EZB_NWK_SIGNAL_NETWORK_STATUS`) is logged
+    only — its `status` is a per-frame routing diagnostic (NO_ROUTE_AVAILABLE,
+    INDIRECT_TRANSACTION_EXPIRY, …) about other devices that fires routinely on a
+    healthy coordinator, so it must NOT flap `s_net_up`.
   - **MED — post-start NV config silently lost** (`ezb_apply_config`): once the
     stack is started the buffered config has already been consumed and
     `start_stack` is idempotent-true, so a post-start `apply_config` re-staged
