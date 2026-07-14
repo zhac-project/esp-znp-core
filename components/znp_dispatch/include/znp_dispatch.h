@@ -151,6 +151,17 @@ size_t znp_build_leave_ind(uint16_t src_addr, uint64_t ieee,
 size_t znp_build_permit_join_rsp(uint16_t src_addr, uint8_t status,
                                  uint8_t *buf, size_t cap);
 
+/* Phase 5 (interview) — ZDO ACTIVE_EP_RSP AREQ (cmd0 MT_AREQ(ZNP_ZDO), cmd1
+ * 0x85). Emitted after the over-the-air ZDO Active-EP exchange completes, so
+ * the host's zigbee_interview.cpp wait_rsp(0x85, nwk) unblocks. Payload:
+ *   SrcAddr(2 LE) Status(1) NWKAddr(2 LE) ActiveEPCount(1) ActiveEPList(count)
+ * SrcAddr and NWKAddr are both the interviewed device's short address (what
+ * the host matches on). `ep_count` endpoints are copied from `ep_list`.
+ * Returns encoded length, or 0 if the frame would overflow `cap`. */
+size_t znp_build_active_ep_rsp(uint16_t nwk, uint8_t status,
+                               const uint8_t *ep_list, uint8_t ep_count,
+                               uint8_t *buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

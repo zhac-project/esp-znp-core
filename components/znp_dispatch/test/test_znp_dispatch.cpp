@@ -860,6 +860,32 @@ static void test_areq_reset(void) {
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
+/* ── Phase 5: znp_build_active_ep_rsp (ZDO ACTIVE_EP_RSP 0x85) ───────────── */
+static void test_active_ep_rsp() {
+    uint8_t buf[64];
+    const uint8_t eps[2] = {0x01, 0x0A};
+    size_t n = znp_build_active_ep_rsp(0x1234, 0x00, eps, 2, buf, sizeof(buf));
+    /* FE 08 | cmd0=MT_AREQ(ZNP_ZDO)=0x45 cmd1=0x85 |
+       SrcAddr 34 12 | Status 00 | NWKAddr 34 12 | EPCount 02 | EPs 01 0A | FCS */
+    const uint8_t expect[13] = {0xFE,0x08,0x45,0x85,0x34,0x12,0x00,0x34,0x12,0x02,0x01,0x0A,0xC1};
+    CHECK(n == 13);
+    CHECK(memcmp(buf, expect, 13) == 0);
+}
+
+static void test_active_ep_rsp_empty() {
+    uint8_t buf[64];
+    size_t n = znp_build_active_ep_rsp(0x1234, 0x00, nullptr, 0, buf, sizeof(buf));
+    const uint8_t expect[11] = {0xFE,0x06,0x45,0x85,0x34,0x12,0x00,0x34,0x12,0x00,0xC6};
+    CHECK(n == 11);
+    CHECK(memcmp(buf, expect, 11) == 0);
+}
+
+static void test_active_ep_rsp_overflow() {
+    uint8_t small[8];   /* 13-byte frame can't fit */
+    const uint8_t eps[2] = {0x01, 0x0A};
+    CHECK(znp_build_active_ep_rsp(0x1234, 0x00, eps, 2, small, sizeof(small)) == 0);
+}
+
 int main() {
     /* existing */
     test_ping();
@@ -888,6 +914,10 @@ int main() {
     test_tc_dev_ind_overflow();
     test_leave_ind();
     test_leave_ind_rejoin();
+    /* new (Phase 5: ZDO interview responses) */
+    test_active_ep_rsp();
+    test_active_ep_rsp_empty();
+    test_active_ep_rsp_overflow();
     /* new (P6-T33: NV semantics + factory reset) */
     test_factory_new_latch();
     test_nv_write_len_guard_wrap();

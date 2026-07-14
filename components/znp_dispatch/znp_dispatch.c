@@ -606,6 +606,26 @@ size_t znp_build_leave_ind(uint16_t src_addr, uint64_t ieee,
     return mt_encode(&f, buf, cap);
 }
 
+/* Phase 5: ZDO ACTIVE_EP_RSP (0x85). See znp_dispatch.h. */
+size_t znp_build_active_ep_rsp(uint16_t nwk, uint8_t status,
+                               const uint8_t *ep_list, uint8_t ep_count,
+                               uint8_t *buf, size_t cap) {
+    /* A device can advertise at most 32 endpoints (1..240 valid, but the pool
+     * caps far below); bound the local payload buffer regardless of the count
+     * the stack hands us. */
+    if (ep_count > 32) ep_count = 32;
+    uint8_t pl[6 + 32];
+    pl[0] = (uint8_t)(nwk & 0xFF);   /* SrcAddr LE  */
+    pl[1] = (uint8_t)(nwk >> 8);
+    pl[2] = status;
+    pl[3] = (uint8_t)(nwk & 0xFF);   /* NWKAddr LE (== SrcAddr for a device rsp) */
+    pl[4] = (uint8_t)(nwk >> 8);
+    pl[5] = ep_count;
+    if (ep_count && ep_list) memcpy(pl + 6, ep_list, ep_count);
+    mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0x85, (uint8_t)(6 + ep_count), pl };
+    return mt_encode(&f, buf, cap);
+}
+
 /* ZDO_MGMT_PERMIT_JOIN_RSP  AREQ 0x45/0xB6  (def 1 — companion to case 0x36)
  * A faithful TI Z-Stack NCP follows the 0x36 SRSP with this unsolicited RSP.
  * Payload: srcaddr(2 LE) + status(1) = 3 bytes. The current host does not
