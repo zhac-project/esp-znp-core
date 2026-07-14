@@ -162,6 +162,47 @@ size_t znp_build_active_ep_rsp(uint16_t nwk, uint8_t status,
                                const uint8_t *ep_list, uint8_t ep_count,
                                uint8_t *buf, size_t cap);
 
+/* Phase 5 — ZDO NODE_DESC_RSP AREQ (cmd1 0x82). Payload:
+ *   SrcAddr(2 LE) Status(1) NWKAddr(2 LE) NodeDescriptor(13)
+ * The host reads only the logical device type (node-desc is non-fatal on the
+ * ZHAC side). `logical_type` (0=coord,1=router,2=end-device) goes in the low 3
+ * bits of NodeDescriptor byte 0; the remaining descriptor bytes are left as a
+ * benign default. Returns encoded length or 0 on overflow. */
+size_t znp_build_node_desc_rsp(uint16_t nwk, uint8_t status,
+                               uint8_t logical_type,
+                               uint8_t *buf, size_t cap);
+
+/* Phase 5 — ZDO SIMPLE_DESC_RSP AREQ (cmd1 0x84). TI MT layout (host parses
+ * profile@+7, device@+9, in-count@+12): SrcAddr(2) Status(1) NWKAddr(2)
+ * Len(1) Endpoint(1) ProfileID(2 LE) DeviceID(2 LE) DevVer(1)
+ * NumIn(1) InClusters(2*NumIn LE) NumOut(1) OutClusters(2*NumOut LE).
+ * `Len` = the SimpleDescriptor byte count (everything after it). Returns
+ * encoded length or 0 on overflow / bad counts. */
+size_t znp_build_simple_desc_rsp(uint16_t nwk, uint8_t status, uint8_t endpoint,
+                                 uint16_t profile_id, uint16_t device_id,
+                                 uint8_t dev_ver,
+                                 const uint16_t *in_clusters,  uint8_t in_count,
+                                 const uint16_t *out_clusters, uint8_t out_count,
+                                 uint8_t *buf, size_t cap);
+
+/* Phase 6 — AF_INCOMING_MSG AREQ (cmd0 MT_AREQ(ZNP_AF), cmd1 0x81): a device's
+ * ZCL frame delivered up to the host. TI MT layout (host reads group@0,
+ * cluster@2, src_nwk@4, src_ep@6, lqi@9, len@16, data@17):
+ *   GroupID(2) ClusterID(2) SrcAddr(2) SrcEndpoint(1) DstEndpoint(1)
+ *   WasBroadcast(1) LinkQuality(1) SecurityUse(1) TimeStamp(4) TransSeqNum(1)
+ *   Len(1) Data(Len)
+ * Timestamp/securityuse/transseq are emitted as 0 (the host ignores them for
+ * decode). Returns encoded length or 0 on overflow. */
+size_t znp_build_af_incoming_msg(uint16_t group_id, uint16_t cluster_id,
+                                 uint16_t src_nwk, uint8_t src_ep, uint8_t dst_ep,
+                                 uint8_t lqi, const uint8_t *data, uint8_t data_len,
+                                 uint8_t *buf, size_t cap);
+
+/* Phase 6 — AF_DATA_CONFIRM AREQ (cmd0 MT_AREQ(ZNP_AF), cmd1 0x80): confirms a
+ * host AF_DATA_REQUEST. Payload: Status(1) Endpoint(1) TransID(1). */
+size_t znp_build_af_data_confirm(uint8_t status, uint8_t endpoint, uint8_t trans_id,
+                                 uint8_t *buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

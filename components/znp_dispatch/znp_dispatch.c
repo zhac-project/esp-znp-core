@@ -626,6 +626,88 @@ size_t znp_build_active_ep_rsp(uint16_t nwk, uint8_t status,
     return mt_encode(&f, buf, cap);
 }
 
+/* Phase 5: ZDO NODE_DESC_RSP (0x82). See znp_dispatch.h. */
+size_t znp_build_node_desc_rsp(uint16_t nwk, uint8_t status,
+                               uint8_t logical_type,
+                               uint8_t *buf, size_t cap) {
+    uint8_t pl[5 + 13];
+    memset(pl, 0, sizeof(pl));
+    pl[0] = (uint8_t)(nwk & 0xFF);   /* SrcAddr LE */
+    pl[1] = (uint8_t)(nwk >> 8);
+    pl[2] = status;
+    pl[3] = (uint8_t)(nwk & 0xFF);   /* NWKAddr LE */
+    pl[4] = (uint8_t)(nwk >> 8);
+    pl[5] = (uint8_t)(logical_type & 0x07);   /* NodeDescriptor[0]: logical type */
+    mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0x82, (uint8_t)sizeof(pl), pl };
+    return mt_encode(&f, buf, cap);
+}
+
+/* Phase 5: ZDO SIMPLE_DESC_RSP (0x84). See znp_dispatch.h. */
+size_t znp_build_simple_desc_rsp(uint16_t nwk, uint8_t status, uint8_t endpoint,
+                                 uint16_t profile_id, uint16_t device_id,
+                                 uint8_t dev_ver,
+                                 const uint16_t *in_clusters,  uint8_t in_count,
+                                 const uint16_t *out_clusters, uint8_t out_count,
+                                 uint8_t *buf, size_t cap) {
+    if (in_count > 16 || out_count > 16) return 0;
+    uint8_t pl[6 + 8 + 2 * 16 + 2 * 16];
+    size_t k = 0;
+    /* SimpleDescriptor byte count: Endpoint + Profile + Device + Ver + NumIn +
+     * InList + NumOut + OutList. */
+    uint8_t sd_len = (uint8_t)(8 + 2 * in_count + 2 * out_count);
+    pl[k++] = (uint8_t)(nwk & 0xFF);  pl[k++] = (uint8_t)(nwk >> 8);   /* SrcAddr */
+    pl[k++] = status;
+    pl[k++] = (uint8_t)(nwk & 0xFF);  pl[k++] = (uint8_t)(nwk >> 8);   /* NWKAddr */
+    pl[k++] = sd_len;
+    pl[k++] = endpoint;
+    pl[k++] = (uint8_t)(profile_id & 0xFF); pl[k++] = (uint8_t)(profile_id >> 8);
+    pl[k++] = (uint8_t)(device_id & 0xFF);  pl[k++] = (uint8_t)(device_id >> 8);
+    pl[k++] = dev_ver;
+    pl[k++] = in_count;
+    for (uint8_t i = 0; i < in_count; i++) {
+        pl[k++] = (uint8_t)(in_clusters[i] & 0xFF);
+        pl[k++] = (uint8_t)(in_clusters[i] >> 8);
+    }
+    pl[k++] = out_count;
+    for (uint8_t i = 0; i < out_count; i++) {
+        pl[k++] = (uint8_t)(out_clusters[i] & 0xFF);
+        pl[k++] = (uint8_t)(out_clusters[i] >> 8);
+    }
+    mt_frame_t f = { MT_AREQ(ZNP_ZDO), 0x84, (uint8_t)k, pl };
+    return mt_encode(&f, buf, cap);
+}
+
+/* Phase 6: AF_INCOMING_MSG (0x81). See znp_dispatch.h. */
+size_t znp_build_af_incoming_msg(uint16_t group_id, uint16_t cluster_id,
+                                 uint16_t src_nwk, uint8_t src_ep, uint8_t dst_ep,
+                                 uint8_t lqi, const uint8_t *data, uint8_t data_len,
+                                 uint8_t *buf, size_t cap) {
+    /* 17-byte header + data must fit the uint8 MT length field. */
+    if ((size_t)17 + data_len > MT_MAX_PAYLOAD) return 0;
+    uint8_t pl[17 + MT_MAX_PAYLOAD];
+    memset(pl, 0, 17);
+    pl[0]  = (uint8_t)(group_id & 0xFF);   pl[1]  = (uint8_t)(group_id >> 8);
+    pl[2]  = (uint8_t)(cluster_id & 0xFF); pl[3]  = (uint8_t)(cluster_id >> 8);
+    pl[4]  = (uint8_t)(src_nwk & 0xFF);    pl[5]  = (uint8_t)(src_nwk >> 8);
+    pl[6]  = src_ep;
+    pl[7]  = dst_ep;
+    pl[8]  = 0;      /* WasBroadcast */
+    pl[9]  = lqi;
+    /* [10] SecurityUse, [11..14] TimeStamp, [15] TransSeqNum — 0, host ignores */
+    pl[16] = data_len;
+    if (data_len && data) memcpy(pl + 17, data, data_len);
+    mt_frame_t f = { MT_AREQ(ZNP_AF), 0x81, (uint8_t)(17 + data_len), pl };
+    return mt_encode(&f, buf, cap);
+}
+
+/* Phase 6: AF_DATA_CONFIRM (0x80). See znp_dispatch.h. */
+size_t znp_build_af_data_confirm(uint8_t status, uint8_t endpoint, uint8_t trans_id,
+                                 uint8_t *buf, size_t cap) {
+    uint8_t pl[3] = { status, endpoint, trans_id };
+    mt_frame_t f = { MT_AREQ(ZNP_AF), 0x80, 3, pl };
+    return mt_encode(&f, buf, cap);
+}
+
 /* ZDO_MGMT_PERMIT_JOIN_RSP  AREQ 0x45/0xB6  (def 1 — companion to case 0x36)
  * A faithful TI Z-Stack NCP follows the 0x36 SRSP with this unsolicited RSP.
  * Payload: srcaddr(2 LE) + status(1) = 3 bytes. The current host does not

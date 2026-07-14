@@ -886,6 +886,77 @@ static void test_active_ep_rsp_overflow() {
     CHECK(znp_build_active_ep_rsp(0x1234, 0x00, eps, 2, small, sizeof(small)) == 0);
 }
 
+/* ── Phase 5: NODE_DESC_RSP (0x82) + SIMPLE_DESC_RSP (0x84) ──────────────── */
+static void test_node_desc_rsp() {
+    uint8_t buf[64];
+    size_t n = znp_build_node_desc_rsp(0x1234, 0x00, 0x02 /*end-device*/, buf, sizeof(buf));
+    mt_frame_t out;
+    CHECK(mt_decode(buf, n, &out) == MT_DECODE_OK);
+    CHECK(out.cmd0 == MT_AREQ(ZNP_ZDO));
+    CHECK(out.cmd1 == 0x82);
+    CHECK(out.payload_len == 18);
+    CHECK(out.payload[0] == 0x34 && out.payload[1] == 0x12);  /* SrcAddr */
+    CHECK(out.payload[2] == 0x00);                            /* Status  */
+    CHECK((out.payload[5] & 0x07) == 0x02);                   /* logical type */
+}
+
+static void test_simple_desc_rsp() {
+    uint8_t buf[96];
+    const uint16_t in_cl[2]  = {0x0000, 0x0006};
+    const uint16_t out_cl[1] = {0x0019};
+    size_t n = znp_build_simple_desc_rsp(0x1234, 0x00, /*ep*/1,
+                                         /*profile*/0x0104, /*device*/0x0100, /*ver*/0,
+                                         in_cl, 2, out_cl, 1, buf, sizeof(buf));
+    mt_frame_t out;
+    CHECK(mt_decode(buf, n, &out) == MT_DECODE_OK);
+    CHECK(out.cmd0 == MT_AREQ(ZNP_ZDO));
+    CHECK(out.cmd1 == 0x84);
+    const uint8_t* p = out.payload;
+    CHECK(p[5] == (uint8_t)(8 + 2*2 + 2*1));   /* SimpleDesc Len = 14 */
+    CHECK(p[6] == 1);                          /* Endpoint */
+    CHECK(p[7] == 0x04 && p[8] == 0x01);       /* ProfileID 0x0104 LE (host reads +7) */
+    CHECK(p[9] == 0x00 && p[10] == 0x01);      /* DeviceID 0x0100 LE (+9) */
+    CHECK(p[12] == 2);                         /* NumIn (+12) */
+    CHECK(p[13] == 0x00 && p[14] == 0x00);     /* InCluster[0] 0x0000 */
+    CHECK(p[15] == 0x06 && p[16] == 0x00);     /* InCluster[1] 0x0006 */
+    CHECK(p[17] == 1);                         /* NumOut */
+    CHECK(p[18] == 0x19 && p[19] == 0x00);     /* OutCluster[0] 0x0019 */
+    CHECK(znp_build_simple_desc_rsp(0,0,0,0,0,0,in_cl,17,out_cl,1,buf,sizeof(buf)) == 0); /* count guard */
+}
+
+/* ── Phase 6: AF_INCOMING_MSG (0x81) + AF_DATA_CONFIRM (0x80) ────────────── */
+static void test_af_incoming_msg() {
+    uint8_t buf[64];
+    const uint8_t zcl[3] = {0x18, 0x01, 0x0A};   /* ZCL report */
+    size_t n = znp_build_af_incoming_msg(/*group*/0, /*cluster*/0x0006, /*src*/0x1234,
+                                         /*srcep*/1, /*dstep*/1, /*lqi*/200,
+                                         zcl, 3, buf, sizeof(buf));
+    mt_frame_t out;
+    CHECK(mt_decode(buf, n, &out) == MT_DECODE_OK);
+    CHECK(out.cmd0 == MT_AREQ(ZNP_AF));
+    CHECK(out.cmd1 == 0x81);
+    CHECK(out.payload_len == 17 + 3);
+    const uint8_t* p = out.payload;
+    CHECK(p[0] == 0 && p[1] == 0);             /* GroupID (host: 0 = unicast) */
+    CHECK(p[2] == 0x06 && p[3] == 0x00);       /* ClusterID (host reads +2) */
+    CHECK(p[4] == 0x34 && p[5] == 0x12);       /* SrcAddr */
+    CHECK(p[6] == 1);                          /* SrcEndpoint */
+    CHECK(p[9] == 200);                        /* LinkQuality (host reads byte 9) */
+    CHECK(p[16] == 3);                         /* Len (+16) */
+    CHECK(p[17] == 0x18 && p[18] == 0x01 && p[19] == 0x0A);   /* Data (+17) */
+    /* oversize data rejected */
+    static uint8_t big[MT_MAX_PAYLOAD] = {0};
+    CHECK(znp_build_af_incoming_msg(0,0,0,0,0,0,big,240,buf,sizeof(buf)) == 0);
+}
+
+static void test_af_data_confirm() {
+    uint8_t buf[16];
+    size_t n = znp_build_af_data_confirm(0x00, 1, 0x2A, buf, sizeof(buf));
+    const uint8_t expect[8] = {0xFE,0x03,0x44,0x80,0x00,0x01,0x2A, /*FCS*/ (uint8_t)(0x03^0x44^0x80^0x00^0x01^0x2A)};
+    CHECK(n == 8);
+    CHECK(memcmp(buf, expect, 8) == 0);
+}
+
 int main() {
     /* existing */
     test_ping();
@@ -918,6 +989,11 @@ int main() {
     test_active_ep_rsp();
     test_active_ep_rsp_empty();
     test_active_ep_rsp_overflow();
+    test_node_desc_rsp();
+    test_simple_desc_rsp();
+    /* new (Phase 6: AF data path builders) */
+    test_af_incoming_msg();
+    test_af_data_confirm();
     /* new (P6-T33: NV semantics + factory reset) */
     test_factory_new_latch();
     test_nv_write_len_guard_wrap();
