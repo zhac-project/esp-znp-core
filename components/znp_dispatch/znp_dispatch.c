@@ -322,6 +322,28 @@ static size_t dispatch_zdo(const mt_frame_t *req, znp_dispatch_ctx *ctx,
             return encode_srsp_sub(ZNP_ZDO, 0x36, &status, 1, buf, cap);
         }
 
+        /* ZDO interview requests (Phase 5): NODE_DESC_REQ (0x02),
+         * ACTIVE_EP_REQ (0x04), SIMPLE_DESC_REQ (0x05). Host payload:
+         *   DstAddr(2 LE) NWKAddrOfInterest(2 LE) [+ Endpoint(1) for 0x05]
+         * Trigger the over-the-air ZDO via the backend; the descriptor comes
+         * back asynchronously as the matching AREQ (0x82/0x85/0x84). The SRSP
+         * is only the request-accepted status (the byte the host's
+         * znp_sreq_retry reads before it wait_rsp()s for the AREQ). */
+        case 0x02:
+        case 0x04:
+        case 0x05: {
+            uint8_t status = 0x00;
+            if (!req->payload || req->payload_len < 4) {
+                status = 0x02;   /* malformed */
+            } else if (be && be->zdo_request) {
+                uint16_t nwk = (uint16_t)(req->payload[0] | (req->payload[1] << 8));
+                uint8_t  ep  = (req->cmd1 == 0x05 && req->payload_len >= 5)
+                               ? req->payload[4] : 0;
+                if (!be->zdo_request(req->cmd1, nwk, ep)) status = 0x01;
+            }
+            return encode_srsp_sub(ZNP_ZDO, req->cmd1, &status, 1, buf, cap);
+        }
+
         default:
             *matched = false;
             return 0;
@@ -365,7 +387,7 @@ static size_t dispatch_app_cnf(const mt_frame_t *req, znp_dispatch_ctx *ctx,
 
 static size_t dispatch_af(const mt_frame_t *req, znp_dispatch_ctx *ctx,
                           uint8_t *buf, size_t cap, bool *matched) {
-    (void)ctx;
+    const znp_backend_t *be = ctx ? ctx->be : NULL;
     const uint8_t status_ok[1] = { 0x00 };
     *matched = true;
 
@@ -379,6 +401,34 @@ static size_t dispatch_af(const mt_frame_t *req, znp_dispatch_ctx *ctx,
          * OK in real use but we always return 0x00 from the NCP side. */
         case 0x00:
             return encode_srsp_sub(ZNP_AF, 0x00, status_ok, 1, buf, cap);
+
+        /* AF_DATA_REQUEST (0x01): host sends a ZCL frame to a device.
+         * Z-Stack 3.x payload (zhc_send_bridge.cpp af_data_request):
+         *   DstAddr(2 LE) DstEp(1) SrcEp(1) Cluster(2 LE) TransId(1)
+         *   Options(1) Radius(1) Len(1) Data(Len)
+         * The MAC AF_DATA_CONFIRM (0x80) is emitted asynchronously by the ezb
+         * APSDE-confirm path; the SRSP here is just the request-accepted status
+         * (host reads payload[0]). */
+        case 0x01: {
+            uint8_t status = 0x00;
+            const uint8_t *p = req->payload;
+            if (req->payload_len < 10) {
+                status = 0x02;   /* malformed header */
+            } else {
+                uint8_t dlen = p[9];
+                if ((size_t)10 + dlen > req->payload_len) {
+                    status = 0x02;   /* declared length overruns the frame */
+                } else if (be && be->af_data_request) {
+                    uint16_t dst     = (uint16_t)(p[0] | (p[1] << 8));
+                    uint16_t cluster = (uint16_t)(p[4] | (p[5] << 8));
+                    if (!be->af_data_request(dst, p[2], p[3], cluster, p[6],
+                                             p + 10, dlen)) {
+                        status = 0x01;   /* backend transmit failed */
+                    }
+                }
+            }
+            return encode_srsp_sub(ZNP_AF, 0x01, &status, 1, buf, cap);
+        }
 
         default:
             *matched = false;

@@ -36,6 +36,28 @@ static bool fake_bdb_commission(uint8_t ezb_mode) {
     return true;
 }
 
+/* Phase 5/6 dispatch recorders */
+static int      s_zdo_calls = 0;
+static uint8_t  s_zdo_cmd1  = 0;
+static uint16_t s_zdo_nwk   = 0;
+static uint8_t  s_zdo_ep    = 0;
+static bool fake_zdo_request(uint8_t cmd1, uint16_t nwk, uint8_t ep) {
+    s_zdo_calls++; s_zdo_cmd1 = cmd1; s_zdo_nwk = nwk; s_zdo_ep = ep; return true;
+}
+static int      s_af_calls   = 0;
+static uint16_t s_af_dst     = 0;
+static uint16_t s_af_cluster = 0;
+static uint8_t  s_af_tid     = 0;
+static uint8_t  s_af_len     = 0;
+static uint8_t  s_af_b0      = 0;
+static bool fake_af_data_request(uint16_t nwk, uint8_t dep, uint8_t sep,
+                                 uint16_t cluster, uint8_t tid,
+                                 const uint8_t *data, uint8_t len) {
+    (void)dep; (void)sep;
+    s_af_calls++; s_af_dst = nwk; s_af_cluster = cluster; s_af_tid = tid;
+    s_af_len = len; s_af_b0 = (len && data) ? data[0] : 0; return true;
+}
+
 static const znp_backend_t FAKE = {
     .get_ieee       = fake_get_ieee,
     .request_reset  = fake_reset,
@@ -44,6 +66,8 @@ static const znp_backend_t FAKE = {
     .bdb_commission = fake_bdb_commission,
     .get_nwk_info   = NULL,
     .permit_join    = NULL,
+    .zdo_request     = fake_zdo_request,
+    .af_data_request = fake_af_data_request,
 };
 
 static void reset_fake_state(void) {
@@ -116,12 +140,13 @@ static void test_unknown() {
     CHECK(n1 == 8);
     CHECK(memcmp(buf, exp_sys, 8) == 0);
 
-    /* AF_DATA_REQUEST (0x01) is sent by the host ×13 but not yet implemented:
-     * must RPC-error, NOT silently drop (cmd0 = MT_SREQ(ZNP_AF) = 0x24).
-     * FCS = 0x03^0x60^0x00^0x02^0x24^0x01 = 0x44 */
-    mt_frame_t af = { MT_SREQ(ZNP_AF), 0x01, 0, nullptr };
+    /* An unhandled AF cmd (0x99) must RPC-error, NOT silently drop
+     * (cmd0 = MT_SREQ(ZNP_AF) = 0x24). AF_DATA_REQUEST (0x01) is now a real
+     * handler — see test_dispatch_af_data_request.
+     * FCS = 0x03^0x60^0x00^0x02^0x24^0x99 = 0xDC */
+    mt_frame_t af = { MT_SREQ(ZNP_AF), 0x99, 0, nullptr };
     size_t n2 = znp_dispatch(&af, &ctx, buf, sizeof(buf));
-    const uint8_t exp_af[8] = {0xFE,0x03,0x60,0x00,0x02,0x24,0x01,0x44};
+    const uint8_t exp_af[8] = {0xFE,0x03,0x60,0x00,0x02,0x24,0x99,0xDC};
     CHECK(n2 == 8);
     CHECK(memcmp(buf, exp_af, 8) == 0);
 
@@ -811,13 +836,12 @@ static void test_permit_join(void) {
 static void test_rpc_error_unhandled(void) {
     znp_dispatch_ctx ctx = make_ctx();
     uint8_t buf[32];
+    /* NODE_DESC(0x02)/ACTIVE_EP(0x04)/SIMPLE_DESC(0x05) and AF_DATA_REQUEST
+     * (AF 0x01) are now real handlers (Phase 5/6) — moved to their own dispatch
+     * tests. These remain genuinely unrouted, so must still RPC-error. */
     const struct { uint8_t cmd0, cmd1; } victims[] = {
-        { MT_SREQ(ZNP_ZDO), 0x02 },  /* NODE_DESC_REQ   */
-        { MT_SREQ(ZNP_ZDO), 0x04 },  /* SIMPLE_DESC_REQ */
-        { MT_SREQ(ZNP_ZDO), 0x05 },  /* ACTIVE_EP_REQ   */
-        { MT_SREQ(ZNP_ZDO), 0x34 },  /* MGMT_LEAVE_REQ  */
+        { MT_SREQ(ZNP_ZDO), 0x34 },  /* MGMT_LEAVE_REQ  (Phase 7) */
         { MT_SREQ(ZNP_ZDO), 0x3E },  /* MSG_CB_REGISTER */
-        { MT_SREQ(ZNP_AF),  0x01 },  /* AF_DATA_REQUEST */
     };
     for (size_t i = 0; i < sizeof(victims)/sizeof(victims[0]); i++) {
         mt_frame_t r = { victims[i].cmd0, victims[i].cmd1, 0, nullptr };
@@ -957,6 +981,57 @@ static void test_af_data_confirm() {
     CHECK(memcmp(buf, expect, 8) == 0);
 }
 
+/* ── Phase 5/6 dispatch: ZDO interview req + AF_DATA_REQUEST → backend ───── */
+static void test_dispatch_zdo_req() {
+    znp_dispatch_ctx ctx = {}; ctx.be = &FAKE;
+    uint8_t buf[64];
+    /* ACTIVE_EP_REQ (0x04): DstAddr + NWKAddr, both 0x1234 */
+    s_zdo_calls = 0;
+    const uint8_t ep_req[4] = {0x34,0x12,0x34,0x12};
+    mt_frame_t r = { MT_SREQ(ZNP_ZDO), 0x04, 4, ep_req };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    mt_frame_t out;
+    CHECK(mt_decode(buf, n, &out) == MT_DECODE_OK);
+    CHECK(out.cmd0 == MT_SRSP(ZNP_ZDO));
+    CHECK(out.cmd1 == 0x04);
+    CHECK(out.payload_len == 1 && out.payload[0] == 0x00);   /* accepted */
+    CHECK(s_zdo_calls == 1 && s_zdo_cmd1 == 0x04 && s_zdo_nwk == 0x1234);
+    /* SIMPLE_DESC_REQ (0x05) carries the endpoint at payload[4] */
+    s_zdo_calls = 0;
+    const uint8_t sd_req[5] = {0x34,0x12,0x34,0x12,0x0A};
+    mt_frame_t r2 = { MT_SREQ(ZNP_ZDO), 0x05, 5, sd_req };
+    n = znp_dispatch(&r2, &ctx, buf, sizeof(buf));
+    CHECK(mt_decode(buf, n, &out) == MT_DECODE_OK && out.cmd1 == 0x05);
+    CHECK(s_zdo_calls == 1 && s_zdo_cmd1 == 0x05 && s_zdo_ep == 0x0A);
+}
+
+static void test_dispatch_af_data_request() {
+    znp_dispatch_ctx ctx = {}; ctx.be = &FAKE;
+    uint8_t buf[64];
+    s_af_calls = 0;
+    /* DstAddr 1234 | DstEp 0A | SrcEp 01 | Cluster 0006 | Tid 2A |
+       Options 00 | Radius 0F | Len 03 | Data 18 01 0A */
+    const uint8_t af[13] = {0x34,0x12, 0x0A, 0x01, 0x06,0x00, 0x2A, 0x00, 0x0F,
+                            0x03, 0x18,0x01,0x0A};
+    mt_frame_t r = { MT_SREQ(ZNP_AF), 0x01, sizeof(af), af };
+    size_t n = znp_dispatch(&r, &ctx, buf, sizeof(buf));
+    mt_frame_t out;
+    CHECK(mt_decode(buf, n, &out) == MT_DECODE_OK);
+    CHECK(out.cmd0 == MT_SRSP(ZNP_AF));
+    CHECK(out.cmd1 == 0x01);
+    CHECK(out.payload_len == 1 && out.payload[0] == 0x00);
+    CHECK(s_af_calls == 1);
+    CHECK(s_af_dst == 0x1234 && s_af_cluster == 0x0006 && s_af_tid == 0x2A);
+    CHECK(s_af_len == 3 && s_af_b0 == 0x18);
+    /* declared length overrunning the frame → error status, no backend call */
+    s_af_calls = 0;
+    const uint8_t bad[11] = {0x34,0x12,0x0A,0x01,0x06,0x00,0x2A,0x00,0x0F, 0xFF, 0x18};
+    mt_frame_t rb = { MT_SREQ(ZNP_AF), 0x01, sizeof(bad), bad };
+    n = znp_dispatch(&rb, &ctx, buf, sizeof(buf));
+    CHECK(mt_decode(buf, n, &out) == MT_DECODE_OK && out.payload[0] != 0x00);
+    CHECK(s_af_calls == 0);
+}
+
 int main() {
     /* existing */
     test_ping();
@@ -994,6 +1069,9 @@ int main() {
     /* new (Phase 6: AF data path builders) */
     test_af_incoming_msg();
     test_af_data_confirm();
+    /* new (Phase 5/6: SREQ dispatch → backend vtable) */
+    test_dispatch_zdo_req();
+    test_dispatch_af_data_request();
     /* new (P6-T33: NV semantics + factory reset) */
     test_factory_new_latch();
     test_nv_write_len_guard_wrap();

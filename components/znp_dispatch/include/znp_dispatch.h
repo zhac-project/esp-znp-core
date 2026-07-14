@@ -99,6 +99,19 @@ typedef struct {
      * persist it across the imminent SYS_RESET (esp_restart) so the next boot
      * erases the Zigbee NVRAM before esp_zigbee_init. May be NULL on host tests. */
     void (*request_factory_new)(void);
+    /* Phase 5: trigger an over-the-air ZDO interview request. `req_cmd1` is the
+     * MT ZDO cmd1 (0x02 NODE_DESC, 0x04 ACTIVE_EP, 0x05 SIMPLE_DESC); `endpoint`
+     * is only meaningful for SIMPLE_DESC. The response returns asynchronously as
+     * the matching AREQ (built by znp_build_{node,active_ep,simple}_desc_rsp and
+     * sent via znp_uart_send_raw). Returns false if the request can't be issued.
+     * Nullable — a NULL hook makes the ZDO SREQ answer status=success but never
+     * produce an AREQ (the host's interview step then times out and falls back). */
+    bool (*zdo_request)(uint8_t req_cmd1, uint16_t nwk, uint8_t endpoint);
+    /* Phase 6: transmit a ZCL frame to a device (AF_DATA_REQUEST → ezb APSDE).
+     * `data`/`len` is the fully-formed ZCL body. Nullable. */
+    bool (*af_data_request)(uint16_t nwk, uint8_t dst_ep, uint8_t src_ep,
+                            uint16_t cluster_id, uint8_t trans_id,
+                            const uint8_t *data, uint8_t len);
 } znp_backend_t;
 
 /* ── Dispatch context (carries config buffer + backend pointer) ──────────── */
