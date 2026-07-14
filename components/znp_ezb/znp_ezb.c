@@ -30,6 +30,7 @@
 #include "ezbee/nwk.h"              /* ezb_nwk_set_device_type, ezb_nwk_get_short_address, ezb_nwk_get_panid */
 #include "ezbee/secur.h"            /* ezb_secur_set_network_key */
 #include "ezbee/error.h"            /* ezb_err_t; success == 0 (no 0 constant) */
+#include "ezbee/aps.h"              /* ezb_apsde_data_request/indication, EZB_APS_ADDR_MODE_*, EZB_APSDE_TX_OPT_* (Phase 6) */
 
 #include <string.h>
 
@@ -332,6 +333,10 @@ static bool bring_up_steps(void)
         }
         s_handler_added = true;
     }
+
+    /* Phase 6: route device→host ZCL frames up as MT AF_INCOMING_MSG. Idempotent
+     * enough to sit next to the signal handler (re-registration replaces the cb). */
+    ezb_apsde_data_indication_handler_register(ezb_on_apsde_ind);
 
     /* 3. Apply the buffered network parameters AFTER init.
      *    These setters mutate stack-internal state; on this worker the mainloop
@@ -708,6 +713,126 @@ static bool s_signal_handler(const ezb_app_signal_t *signal)
 
 /* ── Backend table ───────────────────────────────────────────────────────── */
 
+/* ── Phase 5/6: ZDO interview + AF data path (HW-GATE) ─────────────────────
+ * Binds esp-zigbee-lib's ZDO client + native APSDE APIs to the (host-tested)
+ * MT builders/dispatch. Compiles only inside the firmware IDF build (znp_ezb
+ * pulls the full IDF+SDK); every esp_zb_/ezb_ symbol below is present in
+ * esp-zigbee-lib 2.0.1 (managed_components). Validated on the ESP Thread BR
+ * board — design doc §6. */
+
+/* ZDO response callbacks — build the matching MT AREQ and ship it to the host.
+ * The interviewed device's short address rides in user_ctx. */
+static void ezb_active_ep_cb(esp_zb_zdp_status_t st, uint8_t ep_count,
+                             uint8_t *ep_id_list, void *ctx) {
+    uint16_t nwk = (uint16_t)(uintptr_t)ctx;
+    uint8_t buf[64];
+    size_t n = znp_build_active_ep_rsp(nwk, (uint8_t)st, ep_id_list, ep_count,
+                                       buf, sizeof(buf));
+    if (n) znp_uart_send_raw(buf, n);
+}
+
+static void ezb_simple_desc_cb(esp_zb_zdp_status_t st,
+                               esp_zb_af_simple_desc_1_1_t *sd, void *ctx) {
+    uint16_t nwk = (uint16_t)(uintptr_t)ctx;
+    uint8_t buf[160];
+    size_t n;
+    if (st == 0 && sd) {
+        /* app_cluster_list holds inputs then outputs (in-count then out-count). */
+        n = znp_build_simple_desc_rsp(nwk, (uint8_t)st, sd->endpoint,
+                sd->app_profile_id, sd->app_device_id,
+                (uint8_t)sd->app_device_version,
+                sd->app_cluster_list, sd->app_input_cluster_count,
+                sd->app_cluster_list + sd->app_input_cluster_count,
+                sd->app_output_cluster_count, buf, sizeof(buf));
+    } else {
+        n = znp_build_simple_desc_rsp(nwk, (uint8_t)st, 0, 0, 0, 0,
+                                      NULL, 0, NULL, 0, buf, sizeof(buf));
+    }
+    if (n) znp_uart_send_raw(buf, n);
+}
+
+static void ezb_node_desc_cb(esp_zb_zdp_status_t st,
+                             esp_zb_af_node_desc_t *node_desc, void *ctx) {
+    uint16_t nwk = (uint16_t)(uintptr_t)ctx;
+    /* Node-desc device_type is non-fatal host-side; a safe end-device default
+     * keeps the interview moving. TODO(HW): read the logical-type field from
+     * esp_zb_af_node_desc_s once its exact layout is confirmed on the build. */
+    (void)node_desc;
+    uint8_t buf[32];
+    size_t n = znp_build_node_desc_rsp(nwk, (uint8_t)st, 0x02, buf, sizeof(buf));
+    if (n) znp_uart_send_raw(buf, n);
+}
+
+/* Backend zdo_request: issue the over-the-air ZDO query. The response arrives
+ * asynchronously on the callback above and is shipped as the matching AREQ. */
+static bool ezb_zdo_request(uint8_t cmd1, uint16_t nwk, uint8_t ep) {
+    void *ctx = (void *)(uintptr_t)nwk;
+    esp_zigbee_lock_acquire(portMAX_DELAY);
+    switch (cmd1) {
+        case 0x04: {   /* ACTIVE_EP_REQ */
+            esp_zb_zdo_active_ep_req_param_t p = { .addr_of_interest = nwk };
+            esp_zb_zdo_active_ep_req(&p, ezb_active_ep_cb, ctx);
+            break;
+        }
+        case 0x05: {   /* SIMPLE_DESC_REQ */
+            esp_zb_zdo_simple_desc_req_param_t p = { .addr_of_interest = nwk,
+                                                     .endpoint = ep };
+            esp_zb_zdo_simple_desc_req(&p, ezb_simple_desc_cb, ctx);
+            break;
+        }
+        case 0x02: {   /* NODE_DESC_REQ */
+            esp_zb_zdo_node_desc_req_param_t p = { .dst_nwk_addr = nwk };
+            esp_zb_zdo_node_desc_req(&p, ezb_node_desc_cb, ctx);
+            break;
+        }
+        default:
+            esp_zigbee_lock_release();
+            return false;
+    }
+    esp_zigbee_lock_release();
+    return true;
+}
+
+/* Backend af_data_request: transmit a ZCL frame to a device via APSDE. The MT
+ * trans_id equals the ZCL TSN already embedded in `data`, so ezb needs nothing
+ * extra from it. */
+static bool ezb_af_data_request(uint16_t nwk, uint8_t dst_ep, uint8_t src_ep,
+                                uint16_t cluster_id, uint8_t trans_id,
+                                const uint8_t *data, uint8_t len) {
+    (void)trans_id;
+    ezb_apsde_data_req_t req = {0};
+    req.dst_address.addr_mode    = EZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+    req.dst_address.u.short_addr = nwk;
+    req.dst_endpoint             = dst_ep;
+    req.src_endpoint             = src_ep;
+    req.cluster_id               = cluster_id;
+    req.profile_id               = EZB_AF_HA_PROFILE_ID;
+    req.tx_options               = EZB_APSDE_TX_OPT_ACK_TX;
+    req.radius                   = 0;
+    req.asdu                     = (uint8_t *)data;
+    req.asdu_length              = len;
+    esp_zigbee_lock_acquire(portMAX_DELAY);
+    ezb_err_t e = ezb_apsde_data_request(&req);
+    esp_zigbee_lock_release();
+    return e == EZB_ERR_NONE;
+}
+
+/* APSDE indication → MT AF_INCOMING_MSG. Return true = consumed (the MT host
+ * owns all ZCL decode — the z2m-style "dumb stack, host decodes" model). */
+static bool ezb_on_apsde_ind(const ezb_apsde_data_ind_t *ind) {
+    if (!ind || ind->status != 0) return false;
+    bool is_group   = (ind->dst_address.addr_mode == EZB_ADDR_MODE_GROUP);
+    uint16_t group  = is_group ? ind->dst_address.u.group_addr.group : 0;
+    uint8_t  dlen   = ind->asdu_length > 233 ? 233 : (uint8_t)ind->asdu_length;
+    uint8_t buf[260];
+    size_t n = znp_build_af_incoming_msg(group, ind->cluster_id,
+                    ind->src_address.u.short_addr, ind->src_endpoint,
+                    ind->dst_endpoint, ind->lqi, ind->asdu, dlen,
+                    buf, sizeof(buf));
+    if (n) znp_uart_send_raw(buf, n);
+    return true;
+}
+
 const znp_backend_t *znp_ezb_backend(void)
 {
     static const znp_backend_t b = {
@@ -719,6 +844,8 @@ const znp_backend_t *znp_ezb_backend(void)
         .get_nwk_info         = ezb_get_nwk_info,
         .permit_join          = ezb_permit_join,
         .request_factory_new  = ezb_request_factory_new,
+        .zdo_request          = ezb_zdo_request,
+        .af_data_request      = ezb_af_data_request,
     };
     return &b;
 }
